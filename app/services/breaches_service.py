@@ -8,11 +8,13 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-def *clean(c):
-if not isinstance(c, str): return c
-s = re.sub(r'\[^0-9A-Za-z]+','*',c.strip()).strip('\_').lower()
-return s
-return df.rename(columns=\_clean)
+    def _clean(c):
+        if not isinstance(c, str):
+            return c
+        s = re.sub(r'[^0-9A-Za-z]+', '_', c.strip())
+        return s.strip('_').lower()
+    return df.rename(columns=_clean)
+
 
 def parse\_effective\_date(filename: str) -> date:
 name = os.path.splitext(os.path.basename(filename))\[0]
