@@ -98,6 +98,9 @@ def load_data(folder: str):
       - fact_df
       - rl_df (None if no Risk Limit sheets)
     """
+    if not os.path.exists(folder):
+        raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository.")
+    
     cust_list, fr_list, rl_list = [], [], []
     for fname in os.listdir(folder):
         if not fname.lower().endswith(".xlsx") or fname.startswith("~$"):
@@ -602,11 +605,11 @@ app = FastAPI(title="Unified Risk API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Load data once at startup
-DATA_FOLDER = os.path.join(os.path.dirname(__file__), "Sample_Bank_Data")
+DATA_FOLDER = os.path.join(os.path.dirname(__file__), "Sample_Bank_Data")  # Adjust if folder is elsewhere in repo
 customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
 risk_model = RiskDataModel(customer_df, fact_df, rl_df)
 
-# Breaches Endpoints (from main.py)
+# Breaches Endpoints
 @app.get("/breaches", response_model=BreachesResponse)
 def get_breaches(
     date: str = Query(..., description="DD/MM/YYYY"),
@@ -636,7 +639,7 @@ def get_breaches(
         resp.group_level = full["group"]
     return resp
 
-# Analytics Endpoints (from query_api_app.py)
+# Analytics Endpoints
 @app.get("/api/distinct_values")
 def get_distinct_values(column: str = Query(..., description="Field name like 'staging', 'date', 'cust_name'")):
     try:
