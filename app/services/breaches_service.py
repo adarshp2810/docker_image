@@ -7,6 +7,16 @@ import pandas as pd
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+# File: app/services/breaches_service.py
+
+def calculate_breaches(requested_date: date, page: int, size: int):
+    # your full logic here...
+    return {
+        "customer": cust_resp,
+        "sector": sec_resp,
+        "group": grp_resp
+    }
+
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     def _clean(c):
@@ -60,6 +70,9 @@ def safe_float(x):
     if pd.isna(f) or f in (float('inf'), float('-inf')):
         return 0.0
     return f
+
+
+
 
 
 # Pydantic models
