@@ -99,7 +99,7 @@ def load_data(folder: str):
       - rl_df (None if no Risk Limit sheets)
     """
     if not os.path.exists(folder):
-        raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository.")
+        raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
     
     cust_list, fr_list, rl_list = [], [], []
     for fname in os.listdir(folder):
@@ -605,7 +605,9 @@ app = FastAPI(title="Unified Risk API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Load data once at startup
-DATA_FOLDER = os.path.join(os.path.dirname(__file__), "Sample_Bank_Data")  # Adjust if folder is elsewhere in repo
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FOLDER = os.path.join(SCRIPT_DIR, "Sample_Bank_Data")
+print(f"Looking for data in: {DATA_FOLDER}")
 customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
 risk_model = RiskDataModel(customer_df, fact_df, rl_df)
 
