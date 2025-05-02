@@ -2,7 +2,7 @@ from fastapi import APIRouter, Query, HTTPException
 from typing import Optional
 from app.services.query_service import risk_model
 
-router = APIRouter(prefix="/api", tags=["query"])
+router = APIRouter(prefix="/api", tags=["query"])  # ← note the prefix
 
 @router.get("/distinct_values")
 def distinct_values(column: str = Query(..., description="Field name")):
