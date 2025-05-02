@@ -602,7 +602,7 @@ app = FastAPI(title="Unified Risk API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Load data once at startup
-DATA_FOLDER = r"D:\FAST API\Sample_Bank_Data"  # Adjust as needed
+DATA_FOLDER = os.path.join(os.path.dirname(__file__), "Sample_Bank_Data")
 customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
 risk_model = RiskDataModel(customer_df, fact_df, rl_df)
 
