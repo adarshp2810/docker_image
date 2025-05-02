@@ -7,16 +7,6 @@ import pandas as pd
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-# File: app/services/breaches_service.py
-
-def calculate_breaches(requested_date: date, page: int, size: int):
-    # your full logic here...
-    return {
-        "customer": cust_resp,
-        "sector": sec_resp,
-        "group": grp_resp
-    }
-
 
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     def _clean(c):
@@ -72,10 +62,10 @@ def safe_float(x):
     return f
 
 
+# -----------------------------
+# Pydantic Models
+# -----------------------------
 
-
-
-# Pydantic models
 class CustomerItem(BaseModel):
     customer_name: str
     exposure: float
@@ -124,3 +114,139 @@ class BreachesResponse(BaseModel):
     customer_level: Optional[PagedResponse] = None
     sector_level: Optional[PagedResponse] = None
     group_level: Optional[PagedResponse] = None
+
+
+# -----------------------------
+# Breach Calculation Logic
+# -----------------------------
+
+def calculate_breaches(requested_date: date, page: int, size: int):
+    cust_df, fact_df, rl_df = load_data("./Sample_Bank_Data")
+
+    exposures = fact_df[fact_df['date'] == requested_date].copy()
+    if exposures.empty:
+        raise HTTPException(404, "No exposures for that date")
+
+    limits = rl_df[rl_df['effective_date'] == requested_date]
+    if limits.empty:
+        raise HTTPException(404, "No risk limits for that date")
+
+    cust_limits = (
+        limits[['internal_risk_rating','customer_level_limit']]
+        .dropna(subset=['internal_risk_rating'])
+        .drop_duplicates()
+        .rename(columns={'internal_risk_rating': 'rating', 'customer_level_limit': 'exposure_limit'})
+    )
+    sector_limits = (
+        limits[['sector','sector_limit']]
+        .dropna(subset=['sector'])
+        .drop_duplicates()
+    )
+    group_limits = (
+        limits[['group_name','group_limit']]
+        .dropna(subset=['group_name'])
+        .drop_duplicates()
+        .rename(columns={'group_name': 'group_id', 'group_limit': 'exposure_limit'})
+    )
+
+    exposures = exposures.drop(columns=['cust_name', 'group'], errors='ignore')
+    exposures = exposures.merge(
+        cust_df[['cust_id', 'cust_name', 'sector', 'group_id']],
+        on='cust_id', how='left'
+    )
+
+    # Customer Level
+    cust = exposures.merge(cust_limits, on='rating', how='left')
+    cust['excess_exposure'] = cust['exposure'] - cust['exposure_limit']
+    cust_breach = cust[cust['exposure'] > cust['exposure_limit']]
+    start, end = (page-1)*size, page*size
+    cust_page = cust_breach.iloc[start:end]
+
+    cust_resp = PagedResponse(
+        page=page,
+        page_size=size,
+        total=len(cust_breach),
+        total_exposure=safe_float(cust_breach['excess_exposure'].sum()),
+        items=[
+            CustomerItem(
+                customer_name=row['cust_name'] or "",
+                exposure=safe_float(row['exposure']),
+                rating=int(row['rating']),
+                hc_collateral=safe_float(row.get('total_hc_collateral')),
+                provision=safe_float(row['provision']),
+                exposure_limit=safe_float(row['exposure_limit']),
+                excess_exposure=safe_float(row['excess_exposure']),
+            )
+            for _, row in cust_page.iterrows()
+        ]
+    )
+
+    # Sector Level
+    sector_agg = cust_breach.groupby('sector').apply(
+        lambda df: pd.Series({
+            'exposure': df['exposure'].sum(),
+            'hc_collateral': df['total_hc_collateral'].sum(),
+            'provision': df['provision'].sum(),
+            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum()
+        })
+    ).reset_index()
+    sector = sector_agg.merge(sector_limits, on='sector', how='left')
+    sector['excess_exposure'] = sector['exposure'] - sector['sector_limit']
+    sector_breach = sector[sector['exposure'] > sector['sector_limit']]
+
+    sec_resp = PagedResponse(
+        page=page,
+        page_size=size,
+        total=len(sector_breach),
+        total_exposure=safe_float(sector_breach['excess_exposure'].sum()),
+        items=[
+            SectorItem(
+                sector=row['sector'] or "",
+                avg_rating=safe_float(row['avg_rating']),
+                exposure=safe_float(row['exposure']),
+                hc_collateral=safe_float(row['hc_collateral']),
+                provision=safe_float(row['provision']),
+                exposure_limit=safe_float(row['sector_limit']),
+                excess_exposure=safe_float(row['excess_exposure']),
+            )
+            for _, row in sector_breach.iloc[start:end].iterrows()
+        ]
+    )
+
+    # Group Level
+    group_agg = cust_breach.groupby('group_id').apply(
+        lambda df: pd.Series({
+            'exposure': df['exposure'].sum(),
+            'hc_collateral': df['total_hc_collateral'].sum(),
+            'provision': df['provision'].sum(),
+            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum()
+        })
+    ).reset_index()
+    grp = group_agg.merge(group_limits, on='group_id', how='left')
+    grp['excess_exposure'] = grp['exposure'] - grp['exposure_limit']
+    grp_breach = grp[grp['exposure'] > grp['exposure_limit']]
+
+    grp_resp = PagedResponse(
+        page=page,
+        page_size=size,
+        total=len(grp_breach),
+        total_exposure=safe_float(grp_breach['excess_exposure'].sum()),
+        items=[
+            GroupItem(
+                group_id=int(row['group_id']),
+                avg_rating=safe_float(row['avg_rating']),
+                exposure=safe_float(row['exposure']),
+                hc_collateral=safe_float(row['hc_collateral']),
+                provision=safe_float(row['provision']),
+                exposure_limit=safe_float(row['exposure_limit']),
+                excess_exposure=safe_float(row['excess_exposure']),
+            )
+            for _, row in grp_breach.iloc[start:end].iterrows()
+        ]
+    )
+
+    return {
+        "customer": cust_resp,
+        "sector": sec_resp,
+        "group": grp_resp
+    }
