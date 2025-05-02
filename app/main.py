@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import query, breaches
+
+# import both routers
+from app.routers.query import router as query_router
+from app.routers.breaches import router as breaches_router
 
 app = FastAPI(title="Combined Risk & Breaches API")
 app.add_middleware(
@@ -10,10 +13,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(query.router)
-app.include_router(breaches.router)
+# mount them both
+app.include_router(query_router)
+app.include_router(breaches_router)
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "routes": [r.path for r in app.routes]}
-
+    return {"status": "ok", "routes": [route.path for route in app.routes]}
