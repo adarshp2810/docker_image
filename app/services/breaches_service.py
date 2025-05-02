@@ -7,7 +7,7 @@ import pandas as pd
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-def clean\_column\_names(df: pd.DataFrame) -> pd.DataFrame:
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
 def *clean(c):
 if not isinstance(c, str): return c
 s = re.sub(r'\[^0-9A-Za-z]+','*',c.strip()).strip('\_').lower()
