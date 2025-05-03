@@ -1,6 +1,7 @@
 import os
 import re
 import calendar
+import logging
 from enum import Enum
 from datetime import datetime, date
 from typing import List, Optional
@@ -9,8 +10,13 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from dateutil.relativedelta import relativedelta
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ─── Models ────────────────────────────────────────────────────────────────────
 class CustomerItem(BaseModel):
@@ -91,7 +97,7 @@ def parse_effective_date(filename: str) -> date:
     last_day = calendar.monthrange(year, month)[1]
     return date(year, month, last_day)
 
-def load_data(folder: str):
+def load_data(folder: str, normalize_cols=True):
     """
     Read all .xlsx in folder, return:
       - customer_df
@@ -101,61 +107,86 @@ def load_data(folder: str):
     if not os.path.exists(folder):
         raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
     
-    cust_list, fr_list, rl_list = [], [], []
-    for fname in os.listdir(folder):
-        if not fname.lower().endswith(".xlsx") or fname.startswith("~$"):
-            continue
-        path = os.path.join(folder, fname)
-        try:
-            eff_date = parse_effective_date(path)
-            xls = pd.ExcelFile(path)
+    all_data = {"fact_risk": [], "customer": [], "risk_limit": []}
+    customer_loaded = False
 
-            # CUSTOMER
-            if "CUSTOMER" in xls.sheet_names:
-                c = pd.read_excel(path, sheet_name="CUSTOMER")
-                cust_list.append(clean_column_names(c))
+    for filename in os.listdir(folder):
+        if filename.endswith(".xlsx") and not filename.startswith("~$"):
+            file_path = os.path.join(folder, filename)
+            try:
+                eff_date = parse_effective_date(file_path)
+                xls = pd.ExcelFile(file_path)
+                logger.info(f"Processing file: {filename} with effective date {eff_date}")
 
-            # fact risk
-            if "fact risk" in xls.sheet_names:
-                fr = pd.read_excel(path, sheet_name="fact risk")
-                fr = clean_column_names(fr)
-                fr['date'] = pd.to_datetime(fr['date'], dayfirst=True).dt.date
-                fr['source_file'] = fname
-                fr_list.append(fr)
+                # Load fact risk
+                if "fact risk" in xls.sheet_names:
+                    df_fact = xls.parse("fact risk")
+                    if normalize_cols:
+                        df_fact = clean_column_names(df_fact)
+                    if "date" in df_fact.columns:
+                        df_fact["date"] = pd.to_datetime(df_fact["date"], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+                    for col in df_fact.columns:
+                        if not pd.api.types.is_numeric_dtype(df_fact[col]):
+                            df_fact[col] = df_fact[col].astype("object")
+                    df_fact["source_file"] = filename
+                    all_data["fact_risk"].append(df_fact)
 
-            # Risk Limit
-            if "Risk Limit" in xls.sheet_names:
-                rl = pd.read_excel(path, sheet_name="Risk Limit")
-                rl = clean_column_names(rl)
-                rl['effective_date'] = eff_date
-                rl_list.append(rl)
+                # Load customer only once
+                if not customer_loaded and "CUSTOMER" in xls.sheet_names:
+                    df_cust = xls.parse("CUSTOMER")
+                    if normalize_cols:
+                        df_cust = clean_column_names(df_cust)
+                    all_data["customer"].append(df_cust)
+                    customer_loaded = True
 
-        except Exception as e:
-            print(f"Error loading {fname}: {e}")
+                # Load Risk Limit
+                if "Risk Limit" in xls.sheet_names:
+                    rl = xls.parse("Risk Limit")
+                    if normalize_cols:
+                        rl = clean_column_names(rl)
+                    rl['effective_date'] = eff_date.strftime('%d/%m/%Y')
+                    all_data["risk_limit"].append(rl)
 
-    customer_df = pd.concat(cust_list, ignore_index=True).drop_duplicates(subset=['cust_id']) if cust_list else None
-    fact_df = pd.concat(fr_list, ignore_index=True) if fr_list else None
-    rl_df = pd.concat(rl_list, ignore_index=True) if rl_list else None
-    return customer_df, fact_df, rl_df
+            except Exception as e:
+                logger.error(f"Error loading {filename}: {e}")
+
+    merged_data = {
+        "fact_risk": pd.concat(all_data["fact_risk"], ignore_index=True) if all_data["fact_risk"] else None,
+        "customer": pd.concat(all_data["customer"], ignore_index=True).drop_duplicates(subset=['cust_id']) if all_data["customer"] else None,
+        "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None
+    }
+    
+    # Log loaded data summary
+    if merged_data["fact_risk"] is not None:
+        logger.info(f"Fact risk data loaded with {len(merged_data['fact_risk'])} rows, dates: {merged_data['fact_risk']['date'].unique()}")
+    if merged_data["risk_limit"] is not None:
+        logger.info(f"Risk limit data loaded with {len(merged_data['risk_limit'])} rows, dates: {merged_data['risk_limit']['effective_date'].unique()}")
+    
+    return merged_data["customer"], merged_data["fact_risk"], merged_data["risk_limit"]
 
 # ─── Risk Data Model ───────────────────────────────────────────────────────────
 class RiskDataModel:
     def __init__(self, customer_df, fact_df, rl_df):
-        self.customer_df = customer_df
-        self.fact_df = fact_df
+        self.df_fact_risk = fact_df
+        self.df_customer = customer_df
         self.rl_df = rl_df
+
+        if self.df_customer is not None and "cust_name" in self.df_customer.columns:
+            self.df_customer = self.df_customer.drop(columns=["cust_name"])
+
         self._join_data()
 
     def _join_data(self):
-        if self.fact_df is None or self.customer_df is None:
+        if self.df_fact_risk is None or self.df_customer is None:
             self.df_joined = None
             return
         self.df_joined = pd.merge(
-            self.fact_df,
-            self.customer_df,
+            self.df_fact_risk,
+            self.df_customer,
             how="left",
             on="cust_id"
         )
+
         if "cust_name_x" in self.df_joined.columns and "cust_name_y" in self.df_joined.columns:
             self.df_joined = self.df_joined.drop(columns=["cust_name_y"])
             self.df_joined = self.df_joined.rename(columns={"cust_name_x": "cust_name"})
@@ -164,7 +195,8 @@ class RiskDataModel:
         if self.df_joined is None:
             raise ValueError("No joined data available")
         if column_name not in self.df_joined.columns:
-            raise ValueError(f"Column '{column_name}' not found")
+            raise ValueError(f"Column '{column_name}' not found in the dataset.")
+
         distinct_vals = self.df_joined[column_name].dropna().unique()
         try:
             distinct_vals = sorted(distinct_vals)
@@ -178,16 +210,15 @@ class RiskDataModel:
         df = self.df_joined.copy()
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            df = df[df["date"] == date_filter]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         numerical_fields = [f for f in fact_fields if pd.api.types.is_numeric_dtype(df[f])]
         result = []
@@ -214,30 +245,30 @@ class RiskDataModel:
         df = self.df_joined.copy()
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            df = df[df["date"] == date_filter]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         numerical_fields = [f for f in fact_fields if pd.api.types.is_numeric_dtype(df[f])]
         result = []
 
         if group_by_fields:
+            df[group_by_fields] = df[group_by_fields].fillna('NA')
             agg_df = df.groupby(group_by_fields)[numerical_fields].mean().reset_index()
             for field in numerical_fields:
-                agg_df[field] = round(agg_df[field], 0)
+                agg_df[field] = agg_df[field].fillna(0).replace([float('inf'), -float('inf')], 0).round(0).astype(int)
             result = agg_df.to_dict(orient="records")
             if dimension_filter_field and dimension_filter_value:
                 result.insert(0, {dimension_filter_field: dimension_filter_value})
         else:
             avg_series = df[numerical_fields].mean()
-            avg_series = avg_series.round(0).astype(int)
+            avg_series = avg_series.fillna(0).replace([float('inf'), -float('inf')], 0).round(0).astype(int)
             result = avg_series.to_dict()
             if dimension_filter_field and dimension_filter_value:
                 result = {dimension_filter_field: dimension_filter_value, **result}
@@ -250,16 +281,15 @@ class RiskDataModel:
         df = self.df_joined.copy()
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            df = df[df["date"] == date_filter]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         distinct_count = df[dimension].dropna().nunique()
         result = {"count": distinct_count}
@@ -273,16 +303,15 @@ class RiskDataModel:
         df = self.df_joined.copy()
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            df = df[df["date"] == date_filter]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         fact_field_1 = fact_fields[0]
         fact_field_2 = fact_fields[1] if len(fact_fields) > 1 else fact_fields[0]
@@ -299,7 +328,7 @@ class RiskDataModel:
         concentration = (top_n_value_1 / top_n_value_2) * 100 if top_n_value_2 > 0 else 0
         result = {
             fact_field_1: round(float(top_n_value_1), 0),
-            "concentration_percentage": round(concentration, 0)
+            "concentration_percentage": f"{round(concentration, 0)}%"
         }
         if dimension_filter_field and dimension_filter_value:
             result = {dimension_filter_field: dimension_filter_value, **result}
@@ -311,13 +340,10 @@ class RiskDataModel:
         df = self.df_joined.copy()
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
 
-        try:
-            selected_date = pd.to_datetime(date_filter, dayfirst=True)
-        except Exception:
-            return {"error": "Invalid date format"}
-
+        selected_date = pd.to_datetime(date_filter, dayfirst=True)
         df["period"] = df["date"].dt.to_period(period_type)
         df["period_str"] = df["period"].dt.strftime('%b, %Y')
+
         period_list = [(selected_date - relativedelta(months=i if period_type == "M" else i * 3)).to_period(period_type) for i in range(lookback + 1)]
         period_strs = [p.strftime('%b, %Y') for p in period_list]
         df = df[df["period"].isin(period_list)]
@@ -351,19 +377,19 @@ class RiskDataModel:
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            target_date = pd.to_datetime(date_filter, dayfirst=True)
+            df = df[df["date"] == target_date]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         if fact_field not in df.columns or dimension_field not in df.columns:
-            return {"error": "Invalid input or no data for the given date"}
+            return {"error": "Invalid input or no data for the given date."}
 
         df_ranked = df.groupby(dimension_field)[fact_field].sum().sort_values(ascending=False).reset_index()
         total_fact_field = df_ranked[fact_field].sum()
@@ -382,7 +408,7 @@ class RiskDataModel:
                 segments.append({
                     "segment": segment_name,
                     fact_field: int(segment_total),
-                    "percentage": round(segment_percentage, 1)
+                    "percentage": f"{round(segment_percentage, 1)}%"
                 })
             if others:
                 others_df = df_ranked.iloc[end:]
@@ -391,7 +417,7 @@ class RiskDataModel:
                 segments.append({
                     "segment": "Others",
                     fact_field: int(others_total),
-                    "percentage": round(others_percentage, 1)
+                    "percentage": f"{round(others_percentage, 1)}%"
                 })
         else:
             segment_df = df_ranked.iloc[start - 1:end]
@@ -400,7 +426,7 @@ class RiskDataModel:
             segments.append({
                 "segment": f"Top {start}-{end}",
                 fact_field: int(segment_total),
-                "percentage": round(segment_percentage, 1)
+                "percentage": f"{round(segment_percentage, 1)}%"
             })
             if others:
                 others_df = df_ranked.iloc[end:]
@@ -409,7 +435,7 @@ class RiskDataModel:
                 segments.append({
                     "segment": "Others",
                     fact_field: int(others_total),
-                    "percentage": round(others_percentage, 1)
+                    "percentage": f"{round(others_percentage, 1)}%"
                 })
         return segments
 
@@ -420,19 +446,19 @@ class RiskDataModel:
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
 
         if date_filter:
-            try:
-                target_date = pd.to_datetime(date_filter, dayfirst=True).date()
-                df = df[df["date"] == target_date]
-            except Exception:
-                return {"error": "Invalid date format"}
+            target_date = pd.to_datetime(date_filter, dayfirst=True)
+            df = df[df["date"] == target_date]
 
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found"}
-            df = df[df[dimension_filter_field] == dimension_filter_value]
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
         if df.empty or fact_field not in df.columns or dimension_field not in df.columns:
-            return {"error": "Invalid input or no data for the given date"}
+            return {"error": "Invalid input or no data for the given date."}
 
         ranked_entities = df.groupby(dimension_field)[fact_field].sum().sort_values(ascending=False).reset_index()
         selected_entities = ranked_entities.iloc[start - 1:end]
@@ -471,6 +497,143 @@ class RiskDataModel:
                 })
         return result
 
+    # Commented-out methods
+    def get_top_n_sum(self, fact_fields, group_by_fields, date_filter=None, top_n=5):
+        df = self.df_joined.copy()
+
+        if date_filter:
+            df = df[df["date"] == date_filter]
+
+        numerical_fields = [field for field in fact_fields if pd.api.types.is_numeric_dtype(df[field])]
+        categorical_fields = [field for field in fact_fields if not pd.api.types.is_numeric_dtype(df[field])]
+
+        fact_field_to_rank = fact_fields[0] if isinstance(fact_fields, list) else fact_fields
+        df["sum_fact"] = df[fact_field_to_rank]
+
+        grouped = df.groupby(group_by_fields).agg({
+            "sum_fact": "max",
+            **{field: "max" for field in numerical_fields if field != fact_field_to_rank}
+        }).reset_index()
+
+        top = grouped.sort_values("sum_fact", ascending=False).head(top_n)
+        top.rename(columns={"sum_fact": fact_field_to_rank}, inplace=True)
+
+        other_fields = [f for f in fact_fields if f != fact_field_to_rank]
+
+        for idx, row in top.iterrows():
+            customer = row[group_by_fields[0]]
+            max_fact_value = row[fact_field_to_rank]
+
+            matching_row = df[(df[group_by_fields[0]] == customer) & (df[fact_field_to_rank] == max_fact_value)]
+
+            for field in other_fields:
+                if pd.api.types.is_numeric_dtype(df[field]):
+                    top.at[idx, field] = round(matching_row[field].sum(), 0)
+                else:
+                    top.at[idx, field] = matching_row[field].iloc[0]
+
+        return top
+
+    def get_top_n_trend_by_period(self, fact_field, dimension, date_filter, top_n=10, period_type="M", lookback=5, dimension_filter_field=None, dimension_filter_value=None, attribute_field=None):
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        selected_date = pd.to_datetime(date_filter, dayfirst=True)
+        selected_period = selected_date.to_period(period_type)
+
+        df["period"] = df["date"].dt.to_period(period_type)
+        df["month_year"] = df["period"].dt.strftime('%b %y')
+
+        period_list = [(selected_date - relativedelta(months=i if period_type == "M" else i*3)).to_period(period_type) for i in range(lookback + 1)]
+        period_strs = [p.strftime('%b %y') for p in period_list]
+
+        if dimension_filter_field and dimension_filter_value:
+            df = df[df[dimension_filter_field] == dimension_filter_value]
+            top_dimensions = df[dimension].unique().tolist()
+        else:
+            df_selected_period = df[df["period"] == selected_period]
+            top_dimensions = (
+                df_selected_period.groupby(dimension)[fact_field]
+                .sum()
+                .nlargest(top_n)
+                .index
+                .tolist()
+            )
+            df = df[df[dimension].isin(top_dimensions)]
+
+        df = df[df["period"].isin(period_list)]
+
+        cust_id_to_name = (
+            self.df_joined[["cust_id", "cust_name"]]
+            .drop_duplicates()
+            .set_index("cust_id")["cust_name"]
+            .to_dict()
+        )
+
+        output = []
+
+        for cust in top_dimensions:
+            cust_row = {"cust_name": cust_id_to_name.get(cust, f"ID:{cust}")}
+
+            for p in period_list:
+                p_str = p.strftime('%b %y')
+                df_p = df[(df["period"] == p)]
+
+                if not df_p.empty:
+                    cust_value = df_p[df_p[dimension] == cust][fact_field].sum()
+
+                    if cust_value != 0:
+                        cust_row[f"{p_str}_Exposure"] = round(cust_value, 0)
+
+                        ranks = (
+                            df_p.groupby(dimension)[fact_field]
+                            .sum()
+                            .rank(method="min", ascending=False)
+                        )
+                        cust_row[f"{p_str}_Rank"] = int(ranks.get(cust, np.nan))
+
+                        if attribute_field and attribute_field in df_p.columns:
+                            matching_attr = df_p[df_p[dimension] == cust][attribute_field]
+                            cust_row[f"{p_str}_Rating"] = matching_attr.iloc[0] if not matching_attr.empty else None
+                        else:
+                            cust_row[f"{p_str}_Rating"] = None
+                    else:
+                        cust_row[f"{p_str}_Exposure"] = 0
+                        cust_row[f"{p_str}_Rank"] = None
+                        cust_row[f"{p_str}_Rating"] = None
+                else:
+                    cust_row[f"{p_str}_Exposure"] = 0
+                    cust_row[f"{p_str}_Rank"] = None
+                    cust_row[f"{p_str}_Rating"] = None
+
+            output.append(cust_row)
+
+        ordered_output = []
+        for row in output:
+            ordered_row = {"cust_name": row["cust_name"]}
+            for p in period_list:
+                p_str = p.strftime('%b %y')
+                ordered_row[f"{p_str}_Rating"] = row.get(f"{p_str}_Rating")
+                ordered_row[f"{p_str}_Exposure"] = row.get(f"{p_str}_Exposure")
+                ordered_row[f"{p_str}_Rank"] = row.get(f"{p_str}_Rank")
+            ordered_output.append(ordered_row)
+
+        final_output = []
+        for row in ordered_output:
+            clean_row = {}
+            for k, v in row.items():
+                if isinstance(v, (np.integer, np.int64, np.int32)):
+                    clean_row[k] = int(v)
+                elif isinstance(v, (np.floating, np.float64, np.float32)):
+                    clean_row[k] = float(v)
+                elif isinstance(v, np.bool_):
+                    clean_row[k] = bool(v)
+                else:
+                    clean_row[k] = v
+            final_output.append(clean_row)
+
+        return final_output
+
 # ─── Breach Calculation ────────────────────────────────────────────────────────
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
@@ -478,14 +641,31 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
     if rl_df is None:
         raise HTTPException(400, "Risk Limit data required for breach calculations")
 
-    exposures = fact_df[fact_df['date'] == requested_date].copy()
+    # Convert requested_date to string format for comparison
+    date_str = requested_date.strftime('%d/%m/%Y')
+    logger.info(f"Calculating breaches for date: {date_str}")
+
+    # Filter exposures
+    exposures = fact_df[fact_df['date'] == date_str].copy()
     if exposures.empty:
-        raise HTTPException(404, "No exposures for that date")
+        available_dates = fact_df['date'].unique().tolist() if fact_df is not None else []
+        logger.warning(f"No exposure data found for {date_str}. Available dates: {available_dates}")
+        raise HTTPException(
+            404,
+            f"No exposures for date {date_str}. Available dates: {', '.join(available_dates) or 'none'}"
+        )
 
-    limits = rl_df[rl_df['effective_date'] == requested_date]
+    # Filter risk limits
+    limits = rl_df[rl_df['effective_date'] == date_str].copy()
     if limits.empty:
-        raise HTTPException(404, "No risk limits for that date")
+        available_dates = rl_df['effective_date'].unique().tolist() if rl_df is not None else []
+        logger.warning(f"No risk limit data found for {date_str}. Available dates: {available_dates}")
+        raise HTTPException(
+            404,
+            f"No risk limits for date {date_str}. Available dates: {', '.join(available_dates) or 'none'}"
+        )
 
+    # Prepare limit data
     cust_limits = (
         limits[['internal_risk_rating', 'customer_level_limit']]
         .dropna(subset=['internal_risk_rating'])
@@ -504,12 +684,13 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         .rename(columns={'group_name': 'group_id', 'group_limit': 'exposure_limit'})
     )
 
+    # Merge exposures with customer data
     exposures = exposures.drop(columns=['cust_name', 'group'], errors='ignore')
     exposures = exposures.merge(customer_df[['cust_id', 'cust_name', 'sector', 'group_id']], on='cust_id', how='left')
 
-    # Customer-level
+    # Customer-level breaches
     cust = exposures.merge(cust_limits, on='rating', how='left')
-    cust['excess_exposure'] = cust['exposure'] - cust['exposure_limit']
+    cust['excess_exposure'] = cust['exposure'] - cust['exposure_limit'].fillna(float('inf'))
     cust_breach = cust[cust['exposure'] > cust['exposure_limit']]
     start, end = (page - 1) * size, page * size
     cust_page = cust_breach.iloc[start:end]
@@ -520,10 +701,10 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         total_exposure=safe_float(cust_breach['excess_exposure'].sum()),
         items=[
             CustomerItem(
-                customer_name=row['cust_name'] or "",
+                customer_name=row['cust_name'] or f"ID:{row['cust_id']}",
                 exposure=safe_float(row['exposure']),
-                rating=int(row['rating']),
-                hc_collateral=safe_float(row.get('total_hc_collateral')),
+                rating=int(row['rating']) if pd.notna(row['rating']) else 0,
+                hc_collateral=safe_float(row.get('total_hc_collateral', 0)),
                 provision=safe_float(row['provision']),
                 exposure_limit=safe_float(row['exposure_limit']),
                 excess_exposure=safe_float(row['excess_exposure']),
@@ -532,17 +713,17 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         ]
     )
 
-    # Sector-level
+    # Sector-level breaches
     sector_agg = cust_breach.groupby('sector').apply(
         lambda df: pd.Series({
             'exposure': df['exposure'].sum(),
             'hc_collateral': df['total_hc_collateral'].sum(),
             'provision': df['provision'].sum(),
-            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum()
+            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum() if df['exposure'].sum() > 0 else 0
         })
     ).reset_index()
     sector = sector_agg.merge(sector_limits, on='sector', how='left')
-    sector['excess_exposure'] = sector['exposure'] - sector['sector_limit']
+    sector['excess_exposure'] = sector['exposure'] - sector['sector_limit'].fillna(float('inf'))
     sector_breach = sector[sector['exposure'] > sector['sector_limit']]
     sec_resp = PagedResponse(
         page=page,
@@ -551,7 +732,7 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         total_exposure=safe_float(sector_breach['excess_exposure'].sum()),
         items=[
             SectorItem(
-                sector=row['sector'] or "",
+                sector=row['sector'] or "Unknown",
                 avg_rating=safe_float(row['avg_rating']),
                 exposure=safe_float(row['exposure']),
                 hc_collateral=safe_float(row['hc_collateral']),
@@ -563,17 +744,17 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         ]
     )
 
-    # Group-level
+    # Group-level breaches
     group_agg = cust_breach.groupby('group_id').apply(
         lambda df: pd.Series({
             'exposure': df['exposure'].sum(),
             'hc_collateral': df['total_hc_collateral'].sum(),
             'provision': df['provision'].sum(),
-            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum()
+            'avg_rating': (df['rating'] * df['exposure']).sum() / df['exposure'].sum() if df['exposure'].sum() > 0 else 0
         })
     ).reset_index()
     grp = group_agg.merge(group_limits, on='group_id', how='left')
-    grp['excess_exposure'] = grp['exposure'] - grp['exposure_limit']
+    grp['excess_exposure'] = grp['exposure'] - grp['exposure_limit'].fillna(float('inf'))
     grp_breach = grp[grp['exposure'] > grp['exposure_limit']]
     grp_resp = PagedResponse(
         page=page,
@@ -582,7 +763,7 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         total_exposure=safe_float(grp_breach['excess_exposure'].sum()),
         items=[
             GroupItem(
-                group_id=int(row['group_id']),
+                group_id=int(row['group_id']) if pd.notna(row['group_id']) else 0,
                 avg_rating=safe_float(row['avg_rating']),
                 exposure=safe_float(row['exposure']),
                 hc_collateral=safe_float(row['hc_collateral']),
@@ -604,14 +785,30 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
 app = FastAPI(title="Unified Risk API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# OpenAPI Customization
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["openapi"] = "3.0.0"
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
 # Load data once at startup
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(SCRIPT_DIR, "Sample_Bank_Data")
-print(f"Looking for data in: {DATA_FOLDER}")
+logger.info(f"Looking for data in: {DATA_FOLDER}")
 customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
 risk_model = RiskDataModel(customer_df, fact_df, rl_df)
 
-# Breaches Endpoints
+# Breaches Endpoint
 @app.get("/breaches", response_model=BreachesResponse)
 def get_breaches(
     date: str = Query(..., description="DD/MM/YYYY"),
@@ -624,22 +821,28 @@ def get_breaches(
     except ValueError:
         raise HTTPException(400, "Date must be DD/MM/YYYY")
 
-    full = calculate_breaches(req_date, page, size, customer_df, fact_df, rl_df)
-    if level is None:
-        return BreachesResponse(
-            customer_level=full["customer"],
-            sector_level=full["sector"],
-            group_level=full["group"]
-        )
+    try:
+        full = calculate_breaches(req_date, page, size, customer_df, fact_df, rl_df)
+        if level is None:
+            return BreachesResponse(
+                customer_level=full["customer"],
+                sector_level=full["sector"],
+                group_level=full["group"]
+            )
 
-    resp = BreachesResponse()
-    if level == BreachLevel.customer:
-        resp.customer_level = full["customer"]
-    elif level == BreachLevel.sector:
-        resp.sector_level = full["sector"]
-    else:
-        resp.group_level = full["group"]
-    return resp
+        resp = BreachesResponse()
+        if level == BreachLevel.customer:
+            resp.customer_level = full["customer"]
+        elif level == BreachLevel.sector:
+            resp.sector_level = full["sector"]
+        else:
+            resp.group_level = full["group"]
+        return resp
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error processing breaches for date {date}: {str(e)}")
+        raise HTTPException(500, f"Internal server error: {str(e)}")
 
 # Analytics Endpoints
 @app.get("/api/distinct_values")
@@ -799,6 +1002,49 @@ def get_ranked_entities_with_others(
             others_option=others_option,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
+        )
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+# Commented-out endpoints
+@app.get("/api/top_n_sum")
+def top_n_sum(
+    fact_fields: str = Query(...),
+    group_by_fields: str = Query(...),
+    top_n: int = 5,
+    date_filter: Optional[str] = None
+):
+    fact_fields_list = [field.strip() for field in fact_fields.split(',')]
+    group_by_fields_list = [field.strip() for field in group_by_fields.split(',')]
+    result = risk_model.get_top_n_sum(
+        fact_fields_list, group_by_fields_list, date_filter, top_n
+    )
+    return result.to_dict(orient="records")
+
+@app.get("/api/top_n_trend")
+def top_n_trend(
+    fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
+    dimension: str = Query(..., description="Field to find top N or full list (e.g., cust_id)"),
+    date_filter: str = Query(..., description="Reference date (dd/mm/yyyy)"),
+    top_n: int = Query(10, description="Top N to fetch (ignored if dimension filter given)"),
+    period_type: str = Query("M", description="M for Month, Q for Quarter"),
+    lookback: int = Query(5, description="Periods to go back"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional dimension filter field (e.g., sector)"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional dimension filter value (e.g., Banking)"),
+    attribute_field: Optional[str] = Query(None, description="Optional attribute field to display (e.g., rating)")
+):
+    try:
+        result = risk_model.get_top_n_trend_by_period(
+            fact_field=fact_field,
+            dimension=dimension,
+            date_filter=date_filter,
+            top_n=top_n,
+            period_type=period_type,
+            lookback=lookback,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value,
+            attribute_field=attribute_field
         )
         return result
     except Exception as e:
