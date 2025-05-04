@@ -4,54 +4,52 @@ import calendar
 import logging
 from enum import Enum
 from datetime import datetime, date
-from typing import List, Optional
+from typing import List, Optional, Union, Dict, Literal
 
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, RootModel
 from dateutil.relativedelta import relativedelta
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── Models ────────────────────────────────────────────────────────────────────
 class CustomerItem(BaseModel):
-    customer_name: str
-    exposure: float
-    rating: int
-    hc_collateral: float
-    provision: float
-    exposure_limit: float
-    excess_exposure: float
+    customer_name: str = Query(..., description="The name or identifier of the customer, e.g., 'SABIC' or 'QNB Group'")
+    exposure: float = Query(..., description="The total financial exposure for the customer, representing the amount at risk, e.g., 101610694")
+    rating: int = Query(..., description="The risk rating assigned to the customer, indicating creditworthiness or risk level, e.g., 1 for high rating")
+    hc_collateral: float = Query(..., description="The value of held collateral after applying haircuts to account for risk, e.g., 105120194.5")
+    provision: float = Query(..., description="The amount set aside to cover potential losses for the customer, e.g., 215184.64184")
+    exposure_limit: float = Query(..., description="The maximum allowable exposure for the customer based on their risk rating, e.g., 120000000")
+    excess_exposure: float = Query(..., description="The amount by which the customer's exposure exceeds their exposure limit, positive if exposure > limit")
 
 class SectorItem(BaseModel):
-    sector: str
-    avg_rating: float
-    exposure: float
-    hc_collateral: float
-    provision: float
-    exposure_limit: float
-    excess_exposure: float
+    sector: str = Query(..., description="The name of the industry sector, e.g., 'Financials' or 'Telecommunications'")
+    avg_rating: float = Query(..., description="The average risk rating across customers in the sector, weighted by exposure, calculated as (sum(rating * exposure) / sum(exposure))")
+    exposure: float = Query(..., description="The total financial exposure for all customers in the sector, sum of customer exposures")
+    hc_collateral: float = Query(..., description="The total value of haircut collateral for all customers in the sector, sum of total_hc_collateral")
+    provision: float = Query(..., description="The total provision amount set aside for potential losses in the sector, sum of customer provisions")
+    exposure_limit: float = Query(..., description="The maximum allowable exposure for the sector, as defined in risk limits, e.g., 3836000000 for Financials")
+    excess_exposure: float = Query(..., description="The amount by which the sector's total exposure exceeds its exposure limit, positive if exposure > limit")
 
 class GroupItem(BaseModel):
-    group_id: int
-    avg_rating: float
-    exposure: float
-    hc_collateral: float
-    provision: float
-    exposure_limit: float
-    excess_exposure: float
+    group_id: int = Query(..., description="The unique identifier for the customer group, e.g., 1 for SABIC and Almarai group")
+    avg_rating: float = Query(..., description="The average risk rating across customers in the group, weighted by exposure, calculated as (sum(rating * exposure) / sum(exposure))")
+    exposure: float = Query(..., description="The total financial exposure for all customers in the group, sum of customer exposures")
+    hc_collateral: float = Query(..., description="The total value of haircut collateral for all customers in the group, sum of total_hc_collateral")
+    provision: float = Query(..., description="The total provision amount set aside for potential losses in the group, sum of customer provisions")
+    exposure_limit: float = Query(..., description="The maximum allowable exposure for the group, as defined in risk limits, e.g., 540000000 for group 1")
+    excess_exposure: float = Query(..., description="The amount by which the group's total exposure exceeds its exposure limit, positive if exposure > limit")
 
 class PagedResponse(BaseModel):
-    page: int
-    page_size: int
-    total: int
-    total_exposure: float
-    items: List
+    page: int = Query(..., description="The current page number of the paginated response, e.g., 1 for the first page")
+    page_size: int = Query(..., description="The number of items per page, e.g., 10 for default page size")
+    total: int = Query(..., description="The total number of items across all pages for the query, e.g., 50 if 50 breaches exist")
+    total_exposure: float = Query(..., description="The sum of excess exposure for all items in the query, not just the current page")
+    items: List = Query(..., description="A list of items for the current page, containing CustomerItem, SectorItem, or GroupItem instances, e.g., 10 CustomerItem objects")
 
 class BreachLevel(str, Enum):
     customer = "customer"
@@ -59,13 +57,11 @@ class BreachLevel(str, Enum):
     group = "group"
 
 class BreachesResponse(BaseModel):
-    customer_level: Optional[PagedResponse] = None
-    sector_level: Optional[PagedResponse] = None
-    group_level: Optional[PagedResponse] = None
+    customer_level: Optional[PagedResponse] = Query(None, description="Paginated response for customer-level breaches, list of CustomerItem, null if not requested or no breaches")
+    sector_level: Optional[PagedResponse] = Query(None, description="Paginated response for sector-level breaches, list of SectorItem, null if not requested or no breaches")
+    group_level: Optional[PagedResponse] = Query(None, description="Paginated response for group-level breaches, list of GroupItem, null if not requested or no breaches")
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column names to snake_case."""
     def _clean(c):
         if not isinstance(c, str):
             return c
@@ -74,7 +70,6 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=_clean)
 
 def safe_float(x) -> float:
-    """Coerce NaN/inf into JSON-safe floats."""
     try:
         f = float(x)
     except Exception:
@@ -84,7 +79,6 @@ def safe_float(x) -> float:
     return f
 
 def parse_effective_date(filename: str) -> date:
-    """From 'DEC 2023.xlsx' derive date(2023,12,31)."""
     name = os.path.splitext(os.path.basename(filename))[0]
     parts = name.split()
     if len(parts) != 2:
@@ -98,12 +92,6 @@ def parse_effective_date(filename: str) -> date:
     return date(year, month, last_day)
 
 def load_data(folder: str, normalize_cols=True):
-    """
-    Read all .xlsx in folder, return:
-      - customer_df
-      - fact_df
-      - rl_df (None if no Risk Limit sheets)
-    """
     if not os.path.exists(folder):
         raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
     
@@ -118,7 +106,6 @@ def load_data(folder: str, normalize_cols=True):
                 xls = pd.ExcelFile(file_path)
                 logger.info(f"Processing file: {filename} with effective date {eff_date}")
 
-                # Load fact risk
                 if "fact risk" in xls.sheet_names:
                     df_fact = xls.parse("fact risk")
                     if normalize_cols:
@@ -131,7 +118,6 @@ def load_data(folder: str, normalize_cols=True):
                     df_fact["source_file"] = filename
                     all_data["fact_risk"].append(df_fact)
 
-                # Load customer only once
                 if not customer_loaded and "CUSTOMER" in xls.sheet_names:
                     df_cust = xls.parse("CUSTOMER")
                     if normalize_cols:
@@ -139,7 +125,6 @@ def load_data(folder: str, normalize_cols=True):
                     all_data["customer"].append(df_cust)
                     customer_loaded = True
 
-                # Load Risk Limit
                 if "Risk Limit" in xls.sheet_names:
                     rl = xls.parse("Risk Limit")
                     if normalize_cols:
@@ -156,7 +141,6 @@ def load_data(folder: str, normalize_cols=True):
         "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None
     }
     
-    # Log loaded data summary
     if merged_data["fact_risk"] is not None:
         logger.info(f"Fact risk data loaded with {len(merged_data['fact_risk'])} rows, dates: {merged_data['fact_risk']['date'].unique()}")
     if merged_data["risk_limit"] is not None:
@@ -164,7 +148,6 @@ def load_data(folder: str, normalize_cols=True):
     
     return merged_data["customer"], merged_data["fact_risk"], merged_data["risk_limit"]
 
-# ─── Risk Data Model ───────────────────────────────────────────────────────────
 class RiskDataModel:
     def __init__(self, customer_df, fact_df, rl_df):
         self.df_fact_risk = fact_df
@@ -497,155 +480,15 @@ class RiskDataModel:
                 })
         return result
 
-    # Commented-out methods
-    def get_top_n_sum(self, fact_fields, group_by_fields, date_filter=None, top_n=5):
-        df = self.df_joined.copy()
-
-        if date_filter:
-            df = df[df["date"] == date_filter]
-
-        numerical_fields = [field for field in fact_fields if pd.api.types.is_numeric_dtype(df[field])]
-        categorical_fields = [field for field in fact_fields if not pd.api.types.is_numeric_dtype(df[field])]
-
-        fact_field_to_rank = fact_fields[0] if isinstance(fact_fields, list) else fact_fields
-        df["sum_fact"] = df[fact_field_to_rank]
-
-        grouped = df.groupby(group_by_fields).agg({
-            "sum_fact": "max",
-            **{field: "max" for field in numerical_fields if field != fact_field_to_rank}
-        }).reset_index()
-
-        top = grouped.sort_values("sum_fact", ascending=False).head(top_n)
-        top.rename(columns={"sum_fact": fact_field_to_rank}, inplace=True)
-
-        other_fields = [f for f in fact_fields if f != fact_field_to_rank]
-
-        for idx, row in top.iterrows():
-            customer = row[group_by_fields[0]]
-            max_fact_value = row[fact_field_to_rank]
-
-            matching_row = df[(df[group_by_fields[0]] == customer) & (df[fact_field_to_rank] == max_fact_value)]
-
-            for field in other_fields:
-                if pd.api.types.is_numeric_dtype(df[field]):
-                    top.at[idx, field] = round(matching_row[field].sum(), 0)
-                else:
-                    top.at[idx, field] = matching_row[field].iloc[0]
-
-        return top
-
-    def get_top_n_trend_by_period(self, fact_field, dimension, date_filter, top_n=10, period_type="M", lookback=5, dimension_filter_field=None, dimension_filter_value=None, attribute_field=None):
-        df = self.df_joined.copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
-
-        selected_date = pd.to_datetime(date_filter, dayfirst=True)
-        selected_period = selected_date.to_period(period_type)
-
-        df["period"] = df["date"].dt.to_period(period_type)
-        df["month_year"] = df["period"].dt.strftime('%b %y')
-
-        period_list = [(selected_date - relativedelta(months=i if period_type == "M" else i*3)).to_period(period_type) for i in range(lookback + 1)]
-        period_strs = [p.strftime('%b %y') for p in period_list]
-
-        if dimension_filter_field and dimension_filter_value:
-            df = df[df[dimension_filter_field] == dimension_filter_value]
-            top_dimensions = df[dimension].unique().tolist()
-        else:
-            df_selected_period = df[df["period"] == selected_period]
-            top_dimensions = (
-                df_selected_period.groupby(dimension)[fact_field]
-                .sum()
-                .nlargest(top_n)
-                .index
-                .tolist()
-            )
-            df = df[df[dimension].isin(top_dimensions)]
-
-        df = df[df["period"].isin(period_list)]
-
-        cust_id_to_name = (
-            self.df_joined[["cust_id", "cust_name"]]
-            .drop_duplicates()
-            .set_index("cust_id")["cust_name"]
-            .to_dict()
-        )
-
-        output = []
-
-        for cust in top_dimensions:
-            cust_row = {"cust_name": cust_id_to_name.get(cust, f"ID:{cust}")}
-
-            for p in period_list:
-                p_str = p.strftime('%b %y')
-                df_p = df[(df["period"] == p)]
-
-                if not df_p.empty:
-                    cust_value = df_p[df_p[dimension] == cust][fact_field].sum()
-
-                    if cust_value != 0:
-                        cust_row[f"{p_str}_Exposure"] = round(cust_value, 0)
-
-                        ranks = (
-                            df_p.groupby(dimension)[fact_field]
-                            .sum()
-                            .rank(method="min", ascending=False)
-                        )
-                        cust_row[f"{p_str}_Rank"] = int(ranks.get(cust, np.nan))
-
-                        if attribute_field and attribute_field in df_p.columns:
-                            matching_attr = df_p[df_p[dimension] == cust][attribute_field]
-                            cust_row[f"{p_str}_Rating"] = matching_attr.iloc[0] if not matching_attr.empty else None
-                        else:
-                            cust_row[f"{p_str}_Rating"] = None
-                    else:
-                        cust_row[f"{p_str}_Exposure"] = 0
-                        cust_row[f"{p_str}_Rank"] = None
-                        cust_row[f"{p_str}_Rating"] = None
-                else:
-                    cust_row[f"{p_str}_Exposure"] = 0
-                    cust_row[f"{p_str}_Rank"] = None
-                    cust_row[f"{p_str}_Rating"] = None
-
-            output.append(cust_row)
-
-        ordered_output = []
-        for row in output:
-            ordered_row = {"cust_name": row["cust_name"]}
-            for p in period_list:
-                p_str = p.strftime('%b %y')
-                ordered_row[f"{p_str}_Rating"] = row.get(f"{p_str}_Rating")
-                ordered_row[f"{p_str}_Exposure"] = row.get(f"{p_str}_Exposure")
-                ordered_row[f"{p_str}_Rank"] = row.get(f"{p_str}_Rank")
-            ordered_output.append(ordered_row)
-
-        final_output = []
-        for row in ordered_output:
-            clean_row = {}
-            for k, v in row.items():
-                if isinstance(v, (np.integer, np.int64, np.int32)):
-                    clean_row[k] = int(v)
-                elif isinstance(v, (np.floating, np.float64, np.float32)):
-                    clean_row[k] = float(v)
-                elif isinstance(v, np.bool_):
-                    clean_row[k] = bool(v)
-                else:
-                    clean_row[k] = v
-            final_output.append(clean_row)
-
-        return final_output
-
-# ─── Breach Calculation ────────────────────────────────────────────────────────
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
         raise HTTPException(400, "Missing required data")
     if rl_df is None:
         raise HTTPException(400, "Risk Limit data required for breach calculations")
 
-    # Convert requested_date to string format for comparison
     date_str = requested_date.strftime('%d/%m/%Y')
     logger.info(f"Calculating breaches for date: {date_str}")
 
-    # Filter exposures
     exposures = fact_df[fact_df['date'] == date_str].copy()
     if exposures.empty:
         available_dates = fact_df['date'].unique().tolist() if fact_df is not None else []
@@ -655,7 +498,6 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
             f"No exposures for date {date_str}. Available dates: {', '.join(available_dates) or 'none'}"
         )
 
-    # Filter risk limits
     limits = rl_df[rl_df['effective_date'] == date_str].copy()
     if limits.empty:
         available_dates = rl_df['effective_date'].unique().tolist() if rl_df is not None else []
@@ -665,7 +507,6 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
             f"No risk limits for date {date_str}. Available dates: {', '.join(available_dates) or 'none'}"
         )
 
-    # Prepare limit data
     cust_limits = (
         limits[['internal_risk_rating', 'customer_level_limit']]
         .dropna(subset=['internal_risk_rating'])
@@ -684,11 +525,9 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         .rename(columns={'group_name': 'group_id', 'group_limit': 'exposure_limit'})
     )
 
-    # Merge exposures with customer data
     exposures = exposures.drop(columns=['cust_name', 'group'], errors='ignore')
     exposures = exposures.merge(customer_df[['cust_id', 'cust_name', 'sector', 'group_id']], on='cust_id', how='left')
 
-    # Customer-level breaches
     cust = exposures.merge(cust_limits, on='rating', how='left')
     cust['excess_exposure'] = cust['exposure'] - cust['exposure_limit'].fillna(float('inf'))
     cust_breach = cust[cust['exposure'] > cust['exposure_limit']]
@@ -713,7 +552,6 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         ]
     )
 
-    # Sector-level breaches
     sector_agg = cust_breach.groupby('sector').apply(
         lambda df: pd.Series({
             'exposure': df['exposure'].sum(),
@@ -744,7 +582,6 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         ]
     )
 
-    # Group-level breaches
     group_agg = cust_breach.groupby('group_id').apply(
         lambda df: pd.Series({
             'exposure': df['exposure'].sum(),
@@ -781,11 +618,9 @@ def calculate_breaches(requested_date: date, page: int, size: int, customer_df, 
         "group": grp_resp
     }
 
-# ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Unified Risk API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# OpenAPI Customization
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -801,28 +636,187 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# Load data once at startup
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(SCRIPT_DIR, "Sample_Bank_Data")
 logger.info(f"Looking for data in: {DATA_FOLDER}")
 customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
 risk_model = RiskDataModel(customer_df, fact_df, rl_df)
+from typing import Any, Optional
+from fastapi import HTTPException, Query
+from pydantic import BaseModel, Field
+from datetime import datetime
 
-# Breaches Endpoint
-@app.get("/breaches", response_model=BreachesResponse)
+class ErrorResponse(BaseModel):
+    code: int = Field(..., description="HTTP status code")
+    message: str = Field(..., description="Short, user-friendly error message")
+    details: Optional[Any] = Field(None, description="Optional extra context")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "code": 400,
+                "message": "Date must be in DD/MM/YYYY format",
+                "details": None
+            }
+        }
+@app.get(
+    "/breaches",
+    response_model=BreachesResponse,
+    responses={
+        200: {
+            "model": BreachesResponse,
+            "description": "Successfully retrieved breaches.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "customer_level": {
+                            "page": 1,
+                            "page_size": 10,
+                            "total": 2,
+                            "total_exposure": 120000000.0,
+                            "items": [
+                                {
+                                    "customer_name": "SABIC",
+                                    "exposure": 101610694.0,
+                                    "rating": 1,
+                                    "hc_collateral": 105120194.5,
+                                    "provision": 215184.64,
+                                    "exposure_limit": 120000000.0,
+                                    "excess_exposure": -18389306.0
+                                }
+                            ]
+                        },
+                        "sector_level": {
+                            "page": 1,
+                            "page_size": 10,
+                            "total": 1,
+                            "total_exposure": 3836000000.0,
+                            "items": [
+                                {
+                                    "sector": "Financials",
+                                    "avg_rating": 2.5,
+                                    "exposure": 3836000000.0,
+                                    "hc_collateral": 4000000000.0,
+                                    "provision": 5000000.0,
+                                    "exposure_limit": 3500000000.0,
+                                    "excess_exposure": 336000000.0
+                                }
+                            ]
+                        },
+                        "group_level": {
+                            "page": 1,
+                            "page_size": 10,
+                            "total": 1,
+                            "total_exposure": 540000000.0,
+                            "items": [
+                                {
+                                    "group_id": 1,
+                                    "avg_rating": 3.0,
+                                    "exposure": 540000000.0,
+                                    "hc_collateral": 600000000.0,
+                                    "provision": 1000000.0,
+                                    "exposure_limit": 500000000.0,
+                                    "excess_exposure": 40000000.0
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Bad request — invalid or missing parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 400,
+                        "message": "Date must be DD/MM/YYYY format",
+                        "details": None
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No breaches found for the specified date.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 404,
+                        "message": "No breach data found for 05/04/2025",
+                        "details": None
+                    }
+                }
+            }
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "Validation error — check query parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 422,
+                        "message": "Validation error: missing or invalid parameters",
+                        "details": [
+                            {
+                                "loc": ["query", "date"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        500: {
+            "model": ErrorResponse,
+            "description": "Unexpected server error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 500,
+                        "message": "Internal server error",
+                        "details": "Database connection lost"
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Breaches by Date",
+    description="Returns paginated breaches at customer, sector, and/or group levels for a specified date."
+)
 def get_breaches(
-    date: str = Query(..., description="DD/MM/YYYY"),
-    page: int = Query(1, ge=1),
-    size: int = Query(10, ge=1),
-    level: Optional[BreachLevel] = Query(None, description="Filter by breach level: customer, sector, or group")
+    date: str = Query(..., description="Date in DD/MM/YYYY format"),
+    page: int = Query(1, ge=1, description="Page number, starting from 1"),
+    size: int = Query(10, ge=1, description="Number of items per page"),
+    level: Optional[BreachLevel] = Query(None, description="Filter by breach level")
 ):
     try:
         req_date = datetime.strptime(date, "%d/%m/%Y").date()
     except ValueError:
-        raise HTTPException(400, "Date must be DD/MM/YYYY")
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse(
+                code=400,
+                message="Date must be in DD/MM/YYYY format",
+                details=None
+            ).dict()
+        )
 
     try:
         full = calculate_breaches(req_date, page, size, customer_df, fact_df, rl_df)
+
+        if not any(full.values()):
+            raise HTTPException(
+                status_code=404,
+                detail=ErrorResponse(
+                    code=404,
+                    message=f"No breach data found for {date}",
+                    details=None
+                ).dict()
+            )
+
         if level is None:
             return BreachesResponse(
                 customer_level=full["customer"],
@@ -830,30 +824,229 @@ def get_breaches(
                 group_level=full["group"]
             )
 
-        resp = BreachesResponse()
-        if level == BreachLevel.customer:
-            resp.customer_level = full["customer"]
-        elif level == BreachLevel.sector:
-            resp.sector_level = full["sector"]
-        else:
-            resp.group_level = full["group"]
-        return resp
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.error(f"Error processing breaches for date {date}: {str(e)}")
-        raise HTTPException(500, f"Internal server error: {str(e)}")
+        data = full[level.value]
+        return BreachesResponse(**{f"{level.value}_level": data})
 
-# Analytics Endpoints
-@app.get("/api/distinct_values")
-def get_distinct_values(column: str = Query(..., description="Field name like 'staging', 'date', 'cust_name'")):
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing breaches for date {date}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse(
+                code=500,
+                message="Internal server error",
+                details=str(e)
+            ).dict()
+        )
+
+# --- Custom Field Format Validator ---
+def validate_field_names(field_list: List[str], field_name: str):
+    invalid = [f for f in field_list if not f.islower() or " " in f]
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": ["query", field_name],
+                    "msg": f"Invalid field name(s): {', '.join(invalid)}. Use lowercase with underscores (e.g., 'cust_name')",
+                    "type": "value_error.custom"
+                }
+            ]
+        )
+    
+class DistinctValuesResponse(BaseModel):
+    column: str = Field(..., description="The name of the column queried", example="staging")
+    values: List[Union[str, int, float]] = Field(..., description="List of distinct (non-null) values from the specified column", example=["1", "2", "3B"])
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "column": "staging",
+                "values": ["1", "2", "3B"]
+            }
+        }
+
+class DistinctValuesErrorResponse(BaseModel):
+    error: str = Field(..., description="Description of the error encountered during processing", example="Column 'xyz' not found in the dataset.")
+
+@app.get(
+        "/distinct_values",
+        response_model=DistinctValuesResponse,
+        responses={
+        200: {"description": "Successfully retrieved distinct values."},
+        400: {"model": DistinctValuesErrorResponse, "description": "Bad request — column not found or internal error."},
+        422: {
+            "description": "Validation error due to missing or incorrect parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "column"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "column"],
+                                "msg": "Invalid field name: Cust Name. Use lowercase with underscores (e.g., 'cust_name')",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Distinct Values from Column",
+    description="Returns a list of unique, non-null values from the specified column in the dataset."
+)
+def get_distinct_values(
+    column: str = Query(..., description="Name of the column to query for distinct values (e.g., 'staging', 'date', 'cust_name')")
+):
     try:
+        validate_field_names([column], "column")
         result = risk_model.get_distinct_values(column_name=column)
-        return {column: result}
+        return {"column": column, "values": result}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
-@app.get("/api/sum_by_dimension")
+# --- Success Model: Grouped Results ---
+class GroupedSumRecord(RootModel[List[Dict[str, Union[str, int, float]]]]):
+
+    class Config:
+        json_schema_extra = {
+            "examples": [
+                {
+                    "sector": "Retail",
+                    "exposure": 150000.0,
+                    "provision": 12000.0
+                },
+                {
+                    "sector": "Finance",
+                    "exposure": 200000.0,
+                    "provision": 18000.0
+                }
+            ]
+        }
+
+# --- Success Model: Ungrouped Sum (single-row dict with optional dimension field) ---
+class UngroupedSumResponse(RootModel[Dict[str, Union[str, int, float]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "group": "2",
+                "exposure": 340000.0,
+                "provision": 28000.0
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Description of the error encountered")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'group' not found in the dataset."
+            }
+        }
+    
+@app.get(
+    "/sum_by_dimension",
+    response_model=Union[GroupedSumRecord, UngroupedSumResponse],
+    responses={
+    200: {
+        "description": "Returns aggregated results (grouped or total).",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "Grouped Result": {
+                        "summary": "Grouped by sector",
+                        "value": [
+                            {"sector": "Retail", "exposure": 150000.0, "provision": 12000.0},
+                            {"sector": "Finance", "exposure": 200000.0, "provision": 18000.0}
+                        ]
+                    },
+                    "Ungrouped Result with Dimension Filter": {
+                        "summary": "Flat total with dimension filter (e.g., group=2)",
+                        "value": {
+                            "group": "2",
+                            "exposure": 340000.0,
+                            "provision": 28000.0
+                        }
+                    },
+                    "Ungrouped Result without Dimension Filter": {
+                        "summary": "Flat total with no dimension filter",
+                        "value": {
+                            "exposure": 250000.0,
+                            "provision": 10000.0
+                        }
+                    }
+                }
+            }
+        }
+    },
+    400: {
+        "model": ErrorResponse,
+        "description": "Bad request or processing error"
+    },
+    422: {
+        "description": "Validation error due to missing or incorrect query parameters.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": [
+                        {
+                            "loc": ["query", "fact_fields"],
+                            "msg": "field required",
+                            "type": "value_error.missing"
+                        },
+                        {
+                            "loc": ["query", "group_by_fields"],
+                            "msg": "str type expected",
+                            "type": "type_error.str"
+                        },
+                        {
+                            "loc": ["query", "date_filter"],
+                            "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                            "type": "value_error.date"
+                        },
+                        {
+                            "loc": ["query", "dimension_filter_field"],
+                            "msg": "str type expected",
+                            "type": "type_error.str"
+                        },
+                        {
+                            "loc": ["query", "dimension_filter_value"],
+                            "msg": "str type expected",
+                            "type": "type_error.str"
+                        },
+                        {
+                            "loc": ["query", "fact_fields"],
+                            "msg": "Invalid field name(s): Cust Name. Use lowercase with underscores (e.g., 'cust_name')",
+                            "type": "value_error.custom"
+                        },
+                        {
+                            "loc": ["query", "group_by_fields"],
+                            "msg": "Invalid field name(s): Group ID. Use lowercase with underscores (e.g., 'group_id')",
+                            "type": "value_error.custom"
+                        },
+                        {
+                            "loc": ["query", "dimension_filter_field"],
+                            "msg": "Invalid field name: Sector Name. Use lowercase with underscores (e.g., 'sector_name')",
+                            "type": "value_error.custom"
+                        }
+                    ]
+                }
+            }
+        }
+    }
+},
+    summary="Get Sum by Dimension",
+    description="Aggregates one or more numeric fact fields, optionally grouped by dimensions and filtered by date or a dimension value."
+)
 def get_sum_by_dimension(
     fact_fields: str = Query(..., description="Comma-separated list of fact fields to aggregate, e.g., 'exposure,provision'"),
     group_by_fields: str = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
@@ -862,110 +1055,689 @@ def get_sum_by_dimension(
     dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field to filter by, e.g., 'finance'")
 ):
     try:
-        fact_fields = [field.strip() for field in fact_fields.split(',')]
-        group_by_fields = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
+        fact_fields_list  = [field.strip() for field in fact_fields.split(',')]  # Parse fact_fields as a list
+        group_by_fields_list = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
+
+        validate_field_names(fact_fields_list, "fact_fields")
+        validate_field_names(group_by_fields_list, "group_by_fields")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
         result = risk_model.get_sum_by_dimension(
-            fact_fields=fact_fields,
-            group_by_fields=group_by_fields,
+            fact_fields=fact_fields_list,
+            group_by_fields=group_by_fields_list if group_by_fields else None,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
         return result
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/api/avg_by_dimension")
+# --- Success Response Model ---
+class GroupedAvgRecord(RootModel[List[Dict[str, Union[str, int, float]]]]):
+    class Config:
+        json_schema_extra = {
+            "examples": [
+                {
+                    "sector": "Retail",
+                    "exposure": 150000.0,
+                    "provision": 12000.0
+                },
+                {
+                    "sector": "Finance",
+                    "exposure": 200000.0,
+                    "provision": 18000.0
+                }
+            ]
+        }
+
+class UngroupedAvgResponse(RootModel[Dict[str, Union[str, int, float]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "group": "2",
+                "exposure": 340000.0,
+                "provision": 28000.0
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'group' not found in the dataset."
+            }
+        }
+
+@app.get(
+    "/avg_by_dimension",
+    response_model=Union[GroupedAvgRecord, UngroupedAvgResponse],
+    responses={
+        200: {
+            "description": "Returns average values of specified fact fields, grouped and/or filtered if specified.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Grouped Average": {
+                            "summary": "Grouped by sector",
+                            "value": [
+                                {"sector": "Retail", "exposure": 150000.0, "provision": 12000.0},
+                                {"sector": "Finance", "exposure": 200000.0, "provision": 18000.0}
+                            ]
+                        },
+                        "Ungrouped with Filter": {
+                            "summary": "Flat average with dimension filter",
+                            "value": {
+                                "group": "2",
+                                "exposure": 340000.0,
+                                "provision": 28000.0
+                            }
+                        },
+                        "Ungrouped Total Average": {
+                            "summary": "Flat average with no filters",
+                            "value": {
+                                "exposure": 250000.0,
+                                "provision": 10000.0
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid column or internal error"
+        },
+        422: {
+            "description": "Validation errors — missing, malformed, or incorrectly formatted input fields.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "group_by_fields"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_value"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            },
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "Invalid field name(s): Exposure, Cust Name. Use lowercase with underscores (e.g., 'cust_name')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "group_by_fields"],
+                                "msg": "Invalid field name(s): Group ID. Use lowercase with underscores (e.g., 'group_id')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "Invalid field name: Sector Name. Use lowercase with underscores (e.g., 'sector_name')",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Average by Dimension",
+    description="Computes average values of the given fact fields, optionally grouped and filtered by dimensions and date."
+)
 def get_avg_by_dimension(
-    fact_fields: str = Query(..., description="Comma-separated list of fact fields to calculate average for, e.g., 'exposure,provision'"),
-    group_by_fields: str = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
-    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
-    dimension_filter_field: Optional[str] = Query(None, description="Field name to filter the data by, e.g., 'sector'"),
-    dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field to filter by, e.g., 'finance'")
+    fact_fields: str = Query(..., description="Comma-separated list of numeric fields to average, e.g. 'exposure,provision'"),
+    group_by_fields: Optional[str] = Query(None, description="Comma-separated list of fields to group by, e.g. 'sector'"),
+    date_filter: Optional[str] = Query(None, description="Optional date filter in 'dd/mm/yyyy' format"),
+    dimension_filter_field: Optional[str] = Query(None, description="Field to filter by (e.g., 'group')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value for the filter field (e.g., '3')")
 ):
     try:
-        fact_fields = [field.strip() for field in fact_fields.split(',')]
-        group_by_fields = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
+        fact_fields_list = [f.strip() for f in fact_fields.split(',')]
+        group_by_fields_list = [g.strip() for g in group_by_fields.split(',')] if group_by_fields else []
+
+        # Field naming convention checks
+        validate_field_names(fact_fields_list, "fact_fields")
+        validate_field_names(group_by_fields_list, "group_by_fields")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
         result = risk_model.get_avg_by_dimension(
-            fact_fields=fact_fields,
-            group_by_fields=group_by_fields,
+            fact_fields=fact_fields_list,
+            group_by_fields=group_by_fields_list if group_by_fields else None,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
-@app.get("/api/count_distinct")
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class CountDistinctResponse(RootModel[Dict[str, Union[str, int]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "sector": "Retail",
+                "count": 42
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'segment_name' not found in the dataset."
+            }
+        }
+
+@app.get(
+    "/count_distinct",
+    response_model=CountDistinctResponse,
+    responses={
+        200: {
+            "description": "Returns count of unique values in a dimension field.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "sector": "Retail",
+                        "count": 42
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid dimension or processing error."
+        },
+        422: {
+            "description": "Validation error — missing field, wrong type, or incorrect format.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "dimension"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension"],
+                                "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores (e.g., 'cust_id')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "Invalid field name: Sector Name. Use lowercase with underscores (e.g., 'sector_name')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_value"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Count Distinct Values in a Dimension",
+    description="Returns the number of distinct non-null values in a specified dimension column, with optional date and dimension filtering."
+)
 def count_distinct_values(
-    dimension: str = Query(..., description="Dimension field name, e.g., 'cust_id'"),
-    date_filter: str = Query(None, description="Date in dd/mm/yyyy format"),
-    dimension_filter_field: str = Query(None, description="Field name to filter by, e.g., 'sector'"),
-    dimension_filter_value: str = Query(None, description="Value of the filter field to filter by")
+    dimension: str = Query(..., description="Dimension field name to count unique values from (e.g., 'cust_id')"),
+    date_filter: Optional[str] = Query(None, description="Filter records for a specific date (format: dd/mm/yyyy)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional field name to apply as a filter (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value for the dimension filter (e.g., 'Retail')")
 ):
     try:
-        result = risk_model.count_distinct(dimension, date_filter, dimension_filter_field, dimension_filter_value)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
+        validate_field_names([dimension], "dimension")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
 
-@app.get("/api/get_concentration")
+        result = risk_model.count_distinct(
+            dimension,
+            date_filter,
+            dimension_filter_field,
+            dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Success Response Model ---
+class ConcentrationResponse(RootModel[Dict[str, Union[str, float, int]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "exposure": 1200000.0,
+                "concentration_percentage": "63%"
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'segment name' not found in the dataset."
+            }
+        }
+
+@app.get(
+    "/get_concentration",
+    response_model=ConcentrationResponse,
+    responses={
+        200: {
+            "description": "Returns the concentration percentage of the top N entities over the total.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "With Filter": {
+                            "summary": "Filtered by dimension field",
+                            "value": {
+                                "sector": "Retail",
+                                "exposure": 1200000.0,
+                                "concentration_percentage": "63%"
+                            }
+                        },
+                        "Without Filter": {
+                            "summary": "No dimension filter applied",
+                            "value": {
+                                "exposure": 1800000.0,
+                                "concentration_percentage": "52%"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid input or internal processing error"
+        },
+        422: {
+            "description": "Validation error — required fields missing or field naming incorrect.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "group_by_fields"],
+                                "msg": "str type expected",
+                                "type": "type_error.str"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "top_n"],
+                                "msg": "value is not a valid integer",
+                                "type": "type_error.integer"
+                            },
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "Invalid field name(s): Exposure, Cust ID. Use lowercase with underscores",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "group_by_fields"],
+                                "msg": "Invalid field name(s): Segment Name. Use lowercase with underscores",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "Invalid field name: Sector Name. Use lowercase with underscores",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Concentration Percentage of Top N Entities",
+    description="Calculates the concentration percentage of the top N groups based on a fact field, optionally filtered by date or dimension."
+)
 def get_concentration(
-    fact_fields: str = Query(..., description="Comma-separated fact fields to be used for concentration calculation"),
-    group_by_fields: Optional[str] = Query(None, description="Comma-separated group by fields"),
-    date_filter: str = Query(None, description="Date in dd/mm/yyyy format"),
-    top_n: int = Query(10, description="Top N entities to be considered"),
-    dimension_filter_field: str = Query(None, description="Dimension field to filter by"),
-    dimension_filter_value: str = Query(None, description="Value for the dimension field filter")
+    fact_fields: str = Query(..., description="Comma-separated list of fact fields. First is numerator, second is denominator."),
+    group_by_fields: Optional[str] = Query(None, description="Comma-separated list of fields to group by."),
+    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format."),
+    top_n: int = Query(10, description="Top N groups to consider in numerator."),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional dimension field to filter by."),
+    dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field.")
 ):
     try:
-        fact_fields_list = fact_fields.split(",")
-        group_by_fields_list = group_by_fields.split(",") if group_by_fields else None
+        fact_fields_list = [f.strip() for f in fact_fields.split(',')]
+        group_by_fields_list = [g.strip() for g in group_by_fields.split(',')] if group_by_fields else []
+
+        validate_field_names(fact_fields_list, "fact_fields")
+        validate_field_names(group_by_fields_list, "group_by_fields")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
         result = risk_model.get_concentration(
             fact_fields=fact_fields_list,
-            group_by_fields=group_by_fields_list,
+            group_by_fields=group_by_fields_list if group_by_fields else None,
             date_filter=date_filter,
             top_n=top_n,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
-@app.get("/api/portfolio_trend")
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class PortfolioTrendResponse(RootModel[List[Dict[str, Union[str, int, float, None]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {
+                    "period": "Jan, 2024",
+                    "exposure": 1500000.0,
+                    "direct_exposure": 900000.0,
+                    "avg_rating_score": 3.8,
+                    "total_customers": 72
+                },
+                {
+                    "period": "Feb, 2024",
+                    "exposure": 1450000.0,
+                    "direct_exposure": 920000.0,
+                    "avg_rating_score": 4.0,
+                    "total_customers": 70
+                }
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Invalid date format or missing column in fact_fields"
+            }
+        }
+
+@app.get(
+    "/portfolio_trend",
+    response_model=PortfolioTrendResponse,
+    responses={
+        200: {
+            "description": "Returns period-wise aggregation of selected fields and customer rating summary.",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "period": "Jan, 2024",
+                            "exposure": 1500000.0,
+                            "avg_rating_score": 3.8,
+                            "total_customers": 72
+                        },
+                        {
+                            "period": "Feb, 2024",
+                            "exposure": 1450000.0,
+                            "avg_rating_score": 4.0,
+                            "total_customers": 70
+                        }
+                    ]
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid processing logic or missing input"
+        },
+        422: {
+            "description": "Validation error — missing or incorrectly formatted input fields.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "fact_fields"],
+                                "msg": "Invalid field name(s): Exposure Limit. Use lowercase with underscores (e.g., 'exposure_limit')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "period_type"],
+                                "msg": "unexpected value; allowed: 'M', 'Q'",
+                                "type": "value_error.enum"
+                            },
+                            {
+                                "loc": ["query", "lookback"],
+                                "msg": "value is not a valid integer",
+                                "type": "type_error.integer"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Portfolio Trend Summary",
+    description="Aggregates trend data over a given lookback period (monthly or quarterly), including average rating and total customers."
+)
 def portfolio_trend(
-    fact_fields: str = Query(..., description="Fact fields to aggregate, e.g. exposure,direct_exposure"),
-    date_filter: str = Query(..., description="End date in dd/mm/yyyy format"),
-    period_type: str = Query("M", description="M for Month, Q for Quarter"),
-    lookback: int = Query(5, description="Number of past periods to include")
+    fact_fields: str = Query(..., description="Comma-separated fact fields to aggregate, e.g. 'exposure,direct_exposure'"),
+    date_filter: str = Query(..., description="End date for the trend period in dd/mm/yyyy format"),
+    period_type: Literal["M", "Q"] = Query("M", description="Period granularity: 'M' for monthly, 'Q' for quarterly"),
+    lookback: int = Query(5, description="Number of periods (months or quarters) to look back")
 ):
     try:
         fact_field_list = [field.strip() for field in fact_fields.split(",") if field.strip()]
+
+        validate_field_names(fact_field_list, "fact_fields")
+
+        # Manual validation for date format
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": ["query", "date_filter"],
+                        "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                        "type": "value_error.date"
+                    }
+                ]
+            )
+
         result = risk_model.get_portfolio_trend_summary(
             fact_fields=fact_field_list,
             date_filter=date_filter,
             period_type=period_type,
             lookback=lookback
         )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
-@app.get("/api/segment_distribution")
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class SegmentDistributionResponse(RootModel[List[Dict[str, Union[str, int]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"segment": "Top 1–10", "exposure": 1200000, "percentage": "60.0%"},
+                {"segment": "Top 11–20", "exposure": 500000, "percentage": "25.0%"},
+                {"segment": "Others", "exposure": 300000, "percentage": "15.0%"}
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'cust segment' not found in the dataset."}
+        }
+
+@app.get(
+    "/segment_distribution",
+    response_model=SegmentDistributionResponse,
+    responses={
+        200: {
+            "description": "Returns segmented distribution of fact field across dimension groups.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic segment distribution",
+                            "value": [
+                                {"segment": "Top 1–10", "exposure": 1200000, "percentage": "60.0%"},
+                                {"segment": "Top 11–20", "exposure": 500000, "percentage": "25.0%"},
+                                {"segment": "Others", "exposure": 300000, "percentage": "15.0%"}
+                            ]
+                        },
+                        "With Dimension Filter": {
+                            "summary": "With dimension filter",
+                            "value": [
+                                {"sector": "Retail"},
+                                {"segment": "Top 1–10", "exposure": 800000, "percentage": "50.0%"},
+                                {"segment": "Top 11–20", "exposure": 600000, "percentage": "37.5%"},
+                                {"segment": "Others", "exposure": 200000, "percentage": "12.5%"}
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid column or internal processing error"
+        },
+        422: {
+            "description": "Validation error — incorrect or malformed input parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field"], "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date_filter"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "start"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "end"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "interval"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "others"], "msg": "value could not be parsed to a boolean", "type": "type_error.bool"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Sector Name. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Segment Distribution",
+    description="Ranks dimension values by a fact field, segments them into top intervals, and returns percentage share including an 'Others' group."
+)
 def segment_distribution(
-    fact_field: str = Query(..., description="Field to aggregate (e.g., exposure)"),
-    dimension_field: str = Query(..., description="Field to rank by (e.g., cust_id)"),
-    date_filter: Optional[str] = Query(None, description="Date filter in dd/mm/yyyy format"),
-    start: int = Query(1, description="Start rank for top N"),
-    end: Optional[int] = Query(20, description="End rank for top N (optional)"),
-    interval: Optional[int] = Query(10, description="Interval for grouping (optional)"),
-    others: bool = Query(True, description="Group remaining entities as 'Others'"),
-    dimension_filter_field: Optional[str] = Query(None, description="Field to filter by (optional)"),
-    dimension_filter_value: Optional[str] = Query(None, description="Value to filter by (optional)")
+    fact_field: str = Query(..., description="Fact field to aggregate (e.g., 'exposure')"),
+    dimension_field: str = Query(..., description="Dimension to group by (e.g., 'cust_id')"),
+    date_filter: Optional[str] = Query(None, description="Date filter (dd/mm/yyyy)"),
+    start: int = Query(1, description="Start index of ranking (default: 1)"),
+    end: Optional[int] = Query(20, description="End index for segmentation (optional)"),
+    interval: Optional[int] = Query(10, description="Interval size for each segment group (optional)"),
+    others: bool = Query(True, description="Whether to group tail values under 'Others'"),
+    dimension_filter_field: Optional[str] = Query(None, description="Filter field name (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value to filter on (e.g., 'Retail')")
 ):
     try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field], "dimension_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
         result = risk_model.get_segment_distribution(
             fact_field=fact_field,
             dimension_field=dimension_field,
@@ -977,22 +1749,128 @@ def segment_distribution(
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
-@app.get("/api/ranked_entities_with_others")
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class RankedEntitiesResponse(RootModel[List[Dict[str, Union[str, int]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"cust_name": "Alpha Ltd", "exposure": 800000, "percentage": "40.0%"},
+                {"cust_name": "Beta Corp", "exposure": 600000, "percentage": "30.0%"},
+                {"cust_name": "Gamma Inc", "exposure": 400000, "percentage": "20.0%"}
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'segment name' not found in the dataset."
+            }
+        }
+
+@app.get(
+    "/ranked_entities_with_others",
+    response_model=RankedEntitiesResponse,
+    responses={
+        200: {
+            "description": "Returns top N ranked entities with optional 'Others' category.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Ranked Entities (Customer ID)": {
+                            "summary": "Top customers with name mapping",
+                            "value": [
+                                {"cust_name": "Alpha Ltd", "exposure": 800000, "percentage": "40.0%"},
+                                {"cust_name": "Beta Corp", "exposure": 600000, "percentage": "30.0%"},
+                                {"cust_name": "Gamma Inc", "exposure": 400000, "percentage": "20.0%"}
+                            ]
+                        },
+                        "With Others": {
+                            "summary": "Only Others bucket shown",
+                            "value": [
+                                {"segment": "Others", "exposure": 300000, "percentage": "100.0%"}
+                            ]
+                        },
+                        "With Filter": {
+                            "summary": "Filtered by sector = Retail",
+                            "value": [
+                                {"sector": "Retail"},
+                                {"cust_name": "Retail Co A", "exposure": 500000, "percentage": "50.0%"},
+                                {"cust_name": "Retail Co B", "exposure": 300000, "percentage": "30.0%"}
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid inputs or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field"], "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date_filter"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "start"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "end"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "others_option"], "msg": "value could not be parsed to a boolean", "type": "type_error.bool"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Segment Name. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Ranked Entities with Others",
+    description="Returns top N entities ranked by a fact field, optionally including an 'Others' group and name mapping for customers."
+)
 def get_ranked_entities_with_others(
-    fact_field: str,
-    dimension_field: str,
-    date_filter: Optional[str] = None,
-    start: int = 1,
-    end: Optional[int] = 10,
-    others_option: bool = False,
-    dimension_filter_field: Optional[str] = None,
-    dimension_filter_value: Optional[str] = None
+    fact_field: str = Query(..., description="Numeric field to aggregate (e.g., 'exposure')"),
+    dimension_field: str = Query(..., description="Dimension field to rank entities by (e.g., 'cust_id', 'sector')"),
+    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
+    start: int = Query(1, description="Start rank"),
+    end: Optional[int] = Query(10, description="End rank (inclusive)"),
+    others_option: bool = Query(False, description="Return only the 'Others' group"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value for dimension filter (e.g., 'Retail')")
 ):
     try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field], "dimension_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
         result = risk_model.get_ranked_entities_with_others(
             fact_field=fact_field,
             dimension_field=dimension_field,
@@ -1003,52 +1881,16 @@ def get_ranked_entities_with_others(
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
-        return result
-    except Exception as e:
-        return {"error": str(e)}
 
-# Commented-out endpoints
-@app.get("/api/top_n_sum")
-def top_n_sum(
-    fact_fields: str = Query(...),
-    group_by_fields: str = Query(...),
-    top_n: int = 5,
-    date_filter: Optional[str] = None
-):
-    fact_fields_list = [field.strip() for field in fact_fields.split(',')]
-    group_by_fields_list = [field.strip() for field in group_by_fields.split(',')]
-    result = risk_model.get_top_n_sum(
-        fact_fields_list, group_by_fields_list, date_filter, top_n
-    )
-    return result.to_dict(orient="records")
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
 
-@app.get("/api/top_n_trend")
-def top_n_trend(
-    fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
-    dimension: str = Query(..., description="Field to find top N or full list (e.g., cust_id)"),
-    date_filter: str = Query(..., description="Reference date (dd/mm/yyyy)"),
-    top_n: int = Query(10, description="Top N to fetch (ignored if dimension filter given)"),
-    period_type: str = Query("M", description="M for Month, Q for Quarter"),
-    lookback: int = Query(5, description="Periods to go back"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional dimension filter field (e.g., sector)"),
-    dimension_filter_value: Optional[str] = Query(None, description="Optional dimension filter value (e.g., Banking)"),
-    attribute_field: Optional[str] = Query(None, description="Optional attribute field to display (e.g., rating)")
-):
-    try:
-        result = risk_model.get_top_n_trend_by_period(
-            fact_field=fact_field,
-            dimension=dimension,
-            date_filter=date_filter,
-            top_n=top_n,
-            period_type=period_type,
-            lookback=lookback,
-            dimension_filter_field=dimension_filter_field,
-            dimension_filter_value=dimension_filter_value,
-            attribute_field=attribute_field
-        )
         return result
+
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
