@@ -4,7 +4,7 @@ import calendar
 import logging
 from enum import Enum
 from datetime import datetime, date
-from typing import List, Optional, Union, Dict, Literal
+from typing import List, Optional, Union, Dict, Literal ,Any
 
 import pandas as pd
 import numpy as np
@@ -97,6 +97,9 @@ def load_data(folder: str, normalize_cols=True):
     
     all_data = {"fact_risk": [], "customer": [], "risk_limit": []}
     customer_loaded = False
+    rating_loaded = False
+    customer_df = None
+    rating_df = None
 
     for filename in os.listdir(folder):
         if filename.endswith(".xlsx") and not filename.startswith("~$"):
@@ -109,7 +112,7 @@ def load_data(folder: str, normalize_cols=True):
                 if "fact risk" in xls.sheet_names:
                     df_fact = xls.parse("fact risk")
                     if normalize_cols:
-                        df_fact = clean_column_names(df_fact)
+                        df_fact.columns = [str(c).strip().lower().replace(" ", "_") for c in df_fact.columns]
                     if "date" in df_fact.columns:
                         df_fact["date"] = pd.to_datetime(df_fact["date"], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
                     for col in df_fact.columns:
@@ -121,9 +124,19 @@ def load_data(folder: str, normalize_cols=True):
                 if not customer_loaded and "CUSTOMER" in xls.sheet_names:
                     df_cust = xls.parse("CUSTOMER")
                     if normalize_cols:
-                        df_cust = clean_column_names(df_cust)
-                    all_data["customer"].append(df_cust)
+                        df_cust.columns = [str(c).strip().lower().replace(" ", "_") for c in df_cust.columns]
+                    customer_df = df_cust
                     customer_loaded = True
+
+                if not rating_loaded:
+                    for sheet in xls.sheet_names:
+                        if sheet.strip().lower().startswith("rating and pds"):
+                            df_rating = xls.parse(sheet)
+                            if normalize_cols:
+                                df_rating.columns = [str(c).strip().lower().replace(" ", "_") for c in df_rating.columns]
+                            rating_df = df_rating
+                            rating_loaded = True
+                            break
 
                 if "Risk Limit" in xls.sheet_names:
                     rl = xls.parse("Risk Limit")
@@ -134,11 +147,13 @@ def load_data(folder: str, normalize_cols=True):
 
             except Exception as e:
                 logger.error(f"Error loading {filename}: {e}")
-
+    if rating_df is None:
+        print("Warning: Rating sheet not found in any of the files.")
     merged_data = {
         "fact_risk": pd.concat(all_data["fact_risk"], ignore_index=True) if all_data["fact_risk"] else None,
-        "customer": pd.concat(all_data["customer"], ignore_index=True).drop_duplicates(subset=['cust_id']) if all_data["customer"] else None,
-        "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None
+        "customer": customer_df if customer_df is not None else pd.DataFrame(),
+        "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None,
+        "rating": rating_df if rating_df is not None else pd.DataFrame()
     }
     
     if merged_data["fact_risk"] is not None:
@@ -146,13 +161,14 @@ def load_data(folder: str, normalize_cols=True):
     if merged_data["risk_limit"] is not None:
         logger.info(f"Risk limit data loaded with {len(merged_data['risk_limit'])} rows, dates: {merged_data['risk_limit']['effective_date'].unique()}")
     
-    return merged_data["customer"], merged_data["fact_risk"], merged_data["risk_limit"]
+    return merged_data["customer"], merged_data["fact_risk"], merged_data["risk_limit"], merged_data["rating"]
 
 class RiskDataModel:
-    def __init__(self, customer_df, fact_df, rl_df):
+    def __init__(self, customer_df, fact_df, rl_df, rating_df):
         self.df_fact_risk = fact_df
         self.df_customer = customer_df
         self.rl_df = rl_df
+        self.df_rating = rating_df
 
         if self.df_customer is not None and "cust_name" in self.df_customer.columns:
             self.df_customer = self.df_customer.drop(columns=["cust_name"])
@@ -479,6 +495,370 @@ class RiskDataModel:
                     "percentage": f"{percent}%"
                 })
         return result
+    
+    def get_ranked_distribution_by_grouping(
+    self,
+    fact_field: str,
+    dimension_field_to_rank: str,
+    group_by_field: str,
+    start_rank: int = 1,
+    end_rank: Optional[int] = None,
+    others_option: Optional[bool] = False,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None
+    ):
+        df = self.df_joined.copy()
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        if date_filter:
+            df = df[df["date"] == pd.to_datetime(date_filter, dayfirst=True)]
+
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                return {"error": f"Column {dimension_filter_field} not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
+
+        if df.empty or fact_field not in df.columns or dimension_field_to_rank not in df.columns:
+            return {"error": "Invalid input or no data for the given date."}
+
+        # --- Get Top N IDs based on fact_field ---
+        ranked = df.groupby(dimension_field_to_rank)[fact_field].sum().sort_values(ascending=False).reset_index()
+        ranked["rank"] = ranked[fact_field].rank(method="first", ascending=False).astype(int)
+
+        if end_rank is None:
+            end_rank = ranked["rank"].max()
+        
+        if others_option == False:
+            selected_ids = ranked[(ranked["rank"] >= start_rank) & (ranked["rank"] <= end_rank)][dimension_field_to_rank].tolist()
+            subset = df[df[dimension_field_to_rank].isin(selected_ids)]
+
+            # --- Group and sum by selected group_by_field ---
+            grouped = subset.groupby(group_by_field)[fact_field].sum().reset_index()
+
+            # --- Get all possible values for group_by_field ---
+            if group_by_field == "rating":
+                all_vals = sorted(self.df_rating["internal_rating"].dropna().unique())
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field == "group":
+                all_vals = sorted(self.df_customer["group_id"].dropna().unique().astype(int))
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field in self.df_customer.columns:
+                all_vals = self.df_customer[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            else:
+                all_vals = df[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+
+       
+            merged = full_index.merge(grouped, on=group_by_field, how="left").fillna(0)
+            total = merged[fact_field].sum()
+            merged["percentage"] = (merged[fact_field] / total * 100).round(0).astype(str) + "%"
+            merged[fact_field] = merged[fact_field].round(0).astype(int)
+            result = merged.to_dict(orient="records")
+
+            if dimension_filter_field and dimension_filter_value:
+                result = [{dimension_filter_field: dimension_filter_value}] + result
+            
+            return result
+
+        # Handle "Others" option if selected
+        else:
+            # Find all rows with rank > end_rank
+            other_entities = ranked[ranked["rank"] > end_rank]
+            other_ids = other_entities[dimension_field_to_rank].tolist()
+
+            other_subset = df[df[dimension_field_to_rank].isin(other_ids)]
+
+            other_grouped = other_subset.groupby(group_by_field)[fact_field].sum().reset_index()
+            
+            if group_by_field == "rating":
+                all_vals = self.df_rating["internal_rating"].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field == "group":
+                all_vals = self.df_customer["group_id"].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field in self.df_customer.columns:
+                all_vals = self.df_customer[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            else:
+                all_vals = df[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            
+            merged = full_index.merge(other_grouped, on=group_by_field, how="left").fillna(0)
+            total = merged[fact_field].sum()
+            merged["percentage"] = (merged[fact_field] / total * 100).round(0).astype(str) + "%"
+            merged[fact_field] = merged[fact_field].round(0).astype(int)
+            result = merged.to_dict(orient="records")
+
+            if dimension_filter_field and dimension_filter_value:
+                result = [{dimension_filter_field: dimension_filter_value}] + result
+
+            return result
+    
+    def get_perc_distribution_by_field(self, fact_field: str, dimension_field: str, date_filter: Optional[str] = None, dimension_filter_field: Optional[str] = None, dimension_filter_value: Optional[str] = None):
+        df = self.df_joined.copy()
+
+        if date_filter:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+            df = df[df["date"] == pd.to_datetime(date_filter, dayfirst=True)]
+
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                return {"error": f"Column {dimension_filter_field} not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
+
+        if df.empty or fact_field not in df.columns or dimension_field not in df.columns:
+            return {"error": "Invalid input or no data for the given date."}
+
+        # Group by sector and sum the fact_field
+        distribution = df.groupby(dimension_field)[fact_field].sum().reset_index()
+
+        # Calculate total sum of fact_field for percentage calculation
+        total = distribution[fact_field].sum()
+        distribution["percentage"] = (distribution[fact_field] / total * 100).round(0).astype(str) + "%"
+
+        # Only return the percentage column and the dimension field
+        distribution = distribution[[dimension_field, "percentage"]]
+
+        # Add the dimension filter as the first element if provided
+        result = distribution.to_dict(orient="records")
+        if dimension_filter_field and dimension_filter_value:
+            result.insert(0, {dimension_filter_field: dimension_filter_value})
+
+        return result
+    
+    def get_percentage_trend_by_field(
+        self,
+        fact_field: str,
+        dimension_field: str,
+        date: str,
+        period_type: str,
+        lookback_range: int,
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None
+    ):
+        user_date = pd.to_datetime(date, format='%d/%m/%Y')
+        user_month_year = user_date.strftime('%b %y')  
+
+        # Adjust lookback to get previous periods
+        periods = [user_month_year]
+        for i in range(lookback_range):
+            if period_type == "M":  
+                period_date = user_date - pd.DateOffset(months=i+1)
+                period_month_year = period_date.strftime('%b %y')
+            elif period_type == "Q":  
+                period_date = user_date - pd.DateOffset(months=3 * (i+1))
+                period_month_year = period_date.strftime('%b %y')
+            periods.append(period_month_year)
+
+        periods = sorted(periods, key=lambda x: pd.to_datetime(x, format='%b %y'))
+
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                return {"error": f"Column {dimension_filter_field} not found in the dataset."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
+
+        if df.empty or fact_field not in df.columns or dimension_field not in df.columns:
+            return {"error": "Invalid input or no data for the given date."}
+
+        result = []
+
+        if dimension_field == "rating":
+            all_vals = sorted(self.df_rating["internal_rating"].dropna().unique())
+            full_index = pd.DataFrame({dimension_field: all_vals})
+        elif dimension_field == "group":
+            all_vals = sorted(self.df_customer["group_id"].dropna().unique().astype(int))
+            full_index = pd.DataFrame({dimension_field: all_vals})
+        elif dimension_field in self.df_customer.columns:
+            all_vals = self.df_customer[dimension_field].dropna().unique()
+            full_index = pd.DataFrame({dimension_field: all_vals})
+        else:
+            all_vals = df[dimension_field].dropna().unique()
+            full_index = pd.DataFrame({dimension_field: all_vals})
+
+        # Loop through each period to calculate the percentage for each
+        for period in periods:
+            # Filter the data for the current period
+            df_period = df[df['date'].dt.strftime('%b %y') == period]
+            
+            # Group by the dimension_field and calculate the sum of fact_field
+            grouped = df_period.groupby(dimension_field)[fact_field].sum().reset_index()
+            merged = full_index.merge(grouped, on=dimension_field, how="left").fillna(0)
+
+            # Calculate the total sum of the fact field for the period
+            total = merged[fact_field].sum()
+            for index, row in merged.iterrows():
+                if row[fact_field] == 0:
+                    merged.at[index, "percentage"] = "0%"
+                else:
+                    percentage = (row[fact_field] / total * 100).round(0)
+                    merged.at[index, "percentage"] = f"{percentage}%"
+
+            # Include the period as a field
+            merged["period"] = period
+
+            # If cust_id is used as dimension_field, map to cust_name
+            if dimension_field == "cust_id":
+                merged["cust_name"] = merged[dimension_field].map(self.df_customer.set_index("cust_id")["cust_name"])
+            
+            period_dict = {"period": period}
+            for _, row in merged.iterrows():
+                key = str(row[dimension_field])
+                period_dict[key] = row["percentage"]
+            
+            result.append(period_dict)
+
+        if dimension_filter_field and dimension_filter_value:
+            dimension_filter_dict = {dimension_filter_field: dimension_filter_value}
+            result.insert(0, dimension_filter_dict)
+
+        return result
+    
+    def _calculate_periods(self, date: str, lookback: int, period_type: str):
+        """Generate the lookback periods based on the provided date and period type."""
+        date_obj = pd.to_datetime(date, errors="coerce", dayfirst=True)
+        periods = []
+        for i in range(lookback):
+            if period_type == 'M':
+                period = (date_obj - pd.DateOffset(months=i)).strftime('%b %y')
+            elif period_type == 'Q':
+                period = (date_obj - pd.DateOffset(months=3 * i)).strftime('%b %y')
+            periods.append(period)
+        return periods
+     
+    def get_ranked_data_by_period(
+    self,
+    fact_field: str,
+    dimension_field_to_rank: str,
+    date: str,
+    start_rank: int = 1,
+    end_rank: int = 10,
+    period_type: str = 'Q',
+    lookback: int = 5,
+    dimension_field: str = 'rating',
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        # Validate rank range
+        if end_rank < start_rank:
+            return [{"error": f"end_rank ({end_rank}) must be >= start_rank ({start_rank})."}]
+
+        df = self.df_joined.copy()
+
+        # Normalize inputs
+        fact_field = fact_field.lower().strip()
+        dim_rank = dimension_field_to_rank.lower().strip()
+        dim_field = dimension_field.lower().strip()
+        filt_field = dimension_filter_field.lower().strip() if dimension_filter_field else None
+
+        # Validate fields
+        for fld in [fact_field, dim_rank, dim_field]:
+            if fld not in df.columns:
+                return [{"error": f"'{fld}' not found; available: {df.columns.tolist()}"}]
+        if dim_rank == 'cust id' and 'cust name' not in df.columns:
+            return [{"error": "cust name required when ranking by cust id."}]
+
+        logger.info(f"Fact field '{fact_field}' dtype: {df[fact_field].dtype}")
+        logger.info(f"Sample values: {df[fact_field].head(5).tolist()}")
+
+        # Check for duplicates
+        dup_count = df.duplicated(subset=['cust_id', 'date']).sum()
+        if dup_count > 0:
+            logger.warning(f"Found {dup_count} duplicate cust id-date combinations.")
+
+        # Apply optional filter
+        if filt_field and dimension_filter_value is not None:
+            if filt_field not in df.columns:
+                return [{"error": f"Filter field '{filt_field}' not found."}]
+            if filt_field == "group":
+                df = df[df[filt_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[filt_field].astype(str) == str(dimension_filter_value)]
+            logger.info(f"After filter ({filt_field}={dimension_filter_value}): {len(df)} records")
+            if df.empty:
+                return [{"error": "No data after applying filter. Check values."}]
+
+        # Calculate periods and filter
+        periods = self._calculate_periods(date, lookback, period_type)
+        df['period'] = pd.to_datetime(df['date'], errors="coerce", dayfirst=True).dt.strftime('%b %y')
+        df_periods = df[df['period'].isin(periods)]
+        logger.info(f"After period filter ({periods}): {len(df_periods)} records")
+        if df_periods.empty:
+            return [{"error": f"No data for periods: {periods}. Check date or data availability."}]
+
+        # Ensure fact_field numeric
+        df_periods[fact_field] = pd.to_numeric(df_periods[fact_field], errors='coerce')
+        logger.info(f"Fact field '{fact_field}' null count: {df_periods[fact_field].isna().sum()}")
+
+        # Compute dense rank per period
+        df_periods['rank'] = df_periods.groupby('period')[fact_field] \
+                                    .rank(ascending=False, method='dense')
+
+        # Identify primary period and select window
+        primary = periods[0]
+        df_primary = df_periods[df_periods['period'] == primary]
+        logger.info(f"Primary period '{primary}': {len(df_primary)} records")
+        df_selected = df_primary[
+            (df_primary['rank'] >= start_rank) &
+            (df_primary['rank'] <= end_rank)
+        ]
+        logger.info(f"Selected {len(df_selected)} records in rank {start_rank}-{end_rank}")
+        if df_selected.empty:
+            return [{"error": f"No customers in rank range {start_rank}-{end_rank} for {primary}."}]
+
+        # Order keys by rank in primary period
+        order_keys = df_selected.sort_values('rank')[dim_rank].unique().tolist()
+        logger.info(f"Ordered dimension keys: {order_keys}")
+
+        # Build full history for selected keys
+        df_full = df_periods[df_periods[dim_rank].isin(order_keys)]
+
+        def to_python(x):
+            return x.item() if hasattr(x, 'item') else x
+
+        results: List[Dict[str, Any]] = []
+        for key in order_keys:
+            grp = df_full[df_full[dim_rank] == key]
+            entry: Dict[str, Any] = {
+                "Customer ID": to_python(key),
+                "Customer Name": grp['cust_name'].iloc[0]
+            }
+            if filt_field:
+                entry[dimension_filter_field] = to_python(grp[filt_field].iloc[0])
+            entry["Periods"] = []
+            for p in periods:
+                sub = grp[grp['period'] == p]
+                if not sub.empty:
+                    row = sub.iloc[0]
+                    entry["Periods"].append({
+                        "Period": p,
+                        fact_field: to_python(row[fact_field]),
+                        "Rank": int(row['rank']),
+                        dimension_field: to_python(row[dim_field])
+                    })
+                else:
+                    entry["Periods"].append({
+                        "Period": p,
+                        fact_field: None,
+                        "Rank": None,
+                        dimension_field: None
+                    })
+            results.append(entry)
+
+        return results
 
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
@@ -639,8 +1019,8 @@ app.openapi = custom_openapi
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(SCRIPT_DIR, "Sample_Bank_Data")
 logger.info(f"Looking for data in: {DATA_FOLDER}")
-customer_df, fact_df, rl_df = load_data(DATA_FOLDER)
-risk_model = RiskDataModel(customer_df, fact_df, rl_df)
+customer_df, fact_df, rl_df, rating_df = load_data(DATA_FOLDER)
+risk_model = RiskDataModel(customer_df, fact_df, rl_df, rating_df)
 from typing import Any, Optional
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, Field
@@ -854,7 +1234,19 @@ def validate_field_names(field_list: List[str], field_name: str):
                 }
             ]
         )
-    
+
+# --- Period Type Validator ---
+def validate_period_type(period_type: str):
+    if period_type not in ["M", "Q"]:
+        raise HTTPException(
+            status_code=422,
+            detail=[{
+                "loc": ["query", "period_type"],
+                "msg": "period_type must be either 'M' (Monthly) or 'Q' (Quarterly)",
+                "type": "value_error.enum"
+            }]
+        )
+        
 class DistinctValuesResponse(BaseModel):
     column: str = Field(..., description="The name of the column queried", example="staging")
     values: List[Union[str, int, float]] = Field(..., description="List of distinct (non-null) values from the specified column", example=["1", "2", "3B"])
@@ -1878,6 +2270,535 @@ def get_ranked_entities_with_others(
             start=start,
             end=end,
             others_option=others_option,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class RankedDistributionResponse(RootModel[List[Dict[str, Union[str, int]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"group": "Group A", "exposure": 500000, "percentage": "25%"},
+                {"group": "Group B", "exposure": 300000, "percentage": "15%"},
+                {"group": "Group C", "exposure": 200000, "percentage": "10%"}
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'group_id' not found in the dataset."}
+        }
+
+@app.get(
+    "/ranked_distribution_by_grouping",
+    response_model=RankedDistributionResponse,
+    responses={
+        200: {
+            "description": "Returns ranked distribution of entities grouped by a field.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic ranked distribution",
+                            "value": [
+                                {"group": "Group A", "exposure": 500000, "percentage": "25%"},
+                                {"group": "Group B", "exposure": 300000, "percentage": "15%"},
+                                {"group": "Group C", "exposure": 200000, "percentage": "10%"}
+                            ]
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Filtered by sector = Retail",
+                            "value": [
+                                {"sector": "Retail"},
+                                {"group": "Group A", "exposure": 400000, "percentage": "40%"},
+                                {"group": "Group B", "exposure": 300000, "percentage": "30%"},
+                                {"group": "Group C", "exposure": 200000, "percentage": "20%"}
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid input or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field_to_rank"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "group_by_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field_to_rank"], "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "group_by_field"], "msg": "Invalid field name(s): Group Name. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date_filter"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "start_rank"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "end_rank"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "others_option"], "msg": "value could not be parsed to a boolean", "type": "type_error.bool"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Segment Name. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Ranked Distribution by Grouping",
+    description="Ranks entities by a fact field, groups by another field, and returns the percentage distribution."
+)
+def get_ranked_distribution_by_grouping(
+    fact_field: str = Query(..., description="Fact field to be aggregated (e.g., 'exposure')"),
+    dimension_field_to_rank: str = Query(..., description="Dimension field to rank by (e.g., 'cust_id')"),
+    group_by_field: str = Query(..., description="Field to group by (e.g., 'rating')"),
+    start_rank: int = Query(1, ge=1, description="Start rank for top N entities"),
+    end_rank: Optional[int] = Query(None, ge=1, description="End rank for top N entities"),
+    others_option: Optional[bool] = Query(False, description="Whether to group entities beyond end rank into 'Others'"),
+    date_filter: Optional[str] = Query(None, description="Date filter (dd/mm/yyyy)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Dimension field to filter (optional)"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value for the dimension filter (optional)")
+):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field_to_rank], "dimension_field_to_rank")
+        validate_field_names([group_by_field], "group_by_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.get_ranked_distribution_by_grouping(
+            fact_field=fact_field,
+            dimension_field_to_rank=dimension_field_to_rank,
+            group_by_field=group_by_field,
+            start_rank=start_rank,
+            end_rank=end_rank,
+            others_option=others_option,
+            date_filter=date_filter,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+# --- Success Response Model ---
+class PercentDistributionResponse(RootModel[List[Dict[str, Union[str, int]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"sector": "Retail", "percentage": "40%"},
+                {"sector": "Finance", "percentage": "30%"},
+                {"sector": "Healthcare", "percentage": "15%"}
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'sector' not found in the dataset."}
+        }
+
+@app.get(
+    "/percent_distribution_by_field",
+    response_model=PercentDistributionResponse,
+    responses={
+        200: {
+            "description": "Returns the percentage distribution of a fact field across the given dimension.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic percentage distribution by sector",
+                            "value": [
+                                {"sector": "Retail", "percentage": "40%"},
+                                {"sector": "Finance", "percentage": "30%"},
+                                {"sector": "Healthcare", "percentage": "15%"}
+                            ]
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Filtered by group = 1",
+                            "value": [
+                                {"group": "1"},
+                                {"sector": "Retail", "percentage": "60%"},
+                                {"sector": "Finance", "percentage": "40%"}
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid inputs or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field"], "msg": "Invalid field name(s): Sector Name. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date_filter"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Industry Type. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Percentage Distribution by Field",
+    description="Calculates the percentage distribution of a fact field across a given dimension, including optional filters."
+)
+def perc_distribution_by_field(
+    fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
+    dimension_field: str = Query(..., description="Dimension field to group by (e.g., sector)"),
+    date_filter: Optional[str] = Query(None, description="Date filter in dd/mm/yyyy format (optional)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Field to filter the data (optional)"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value to filter the data (optional)")
+):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field], "dimension_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.get_perc_distribution_by_field(
+            fact_field=fact_field,
+            dimension_field=dimension_field,
+            date_filter=date_filter,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class PercentageTrendResponse(RootModel[List[Dict[str, Union[str, int]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"period": "Jan 24", "Retail": "40%", "Finance": "35%", "Others": "25%"},
+                {"period": "Feb 24", "Retail": "38%", "Finance": "37%", "Others": "25%"}
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'sector' not found in the dataset."}
+        }
+
+@app.get(
+    "/percentage_trend_by_field",
+    response_model=PercentageTrendResponse,
+    responses={
+        200: {
+            "description": "Returns percentage trend by field for a given fact field and dimension.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic percentage trend",
+                            "value": [
+                                {"period": "Jan 24", "Retail": "40%", "Finance": "35%", "Others": "25%"},
+                                {"period": "Feb 24", "Retail": "38%", "Finance": "37%", "Others": "25%"}
+                            ]
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Filtered by group = 1",
+                            "value": [
+                                {"group": "1"},
+                                {"period": "Jan 24", "Retail": "50%", "Finance": "30%", "Others": "20%"},
+                                {"period": "Feb 24", "Retail": "48%", "Finance": "32%", "Others": "20%"}
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid inputs or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field"], "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "period_type"], "msg": "unexpected value; allowed: 'M', 'Q'", "type": "value_error.enum"},
+                            {"loc": ["query", "lookback_range"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Sector Name. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Percentage Trend by Field",
+    description="Calculates percentage trends over a period range (monthly or quarterly) for a given fact field and dimension."
+)
+def percentage_trend_by_field(
+    fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
+    dimension_field: str = Query(..., description="Dimension field to group by (e.g., sector)"),
+    date: str = Query(..., description="Date in dd/mm/yyyy format"),
+    period_type: str = Query(..., description="Period type ('M' for monthly or 'Q' for quarterly)"),
+    lookback_range: int = Query(..., description="Lookback range (number of periods to look back)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Field to filter by (optional)"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value to filter by (optional)")
+):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field], "dimension_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        validate_period_type(period_type)
+
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", date):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.get_percentage_trend_by_field(
+            fact_field=fact_field,
+            dimension_field=dimension_field,
+            date=date,
+            period_type=period_type,
+            lookback_range=lookback_range,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success Response Model ---
+class RankedDataByPeriodResponse(RootModel[List[Dict[str, Any]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {
+                    "Customer ID": 12345,
+                    "Customer Name": "John Doe",
+                    "Periods": [
+                        {"Period": "Jan 24", "exposure": 100000, "Rank": 1, "rating": "1"},
+                        {"Period": "Feb 24", "exposure": 120000, "Rank": 1, "rating": "10"}
+                    ]
+                },
+                {
+                    "Customer ID": 67890,
+                    "Customer Name": "Jane Smith",
+                    "Periods": [
+                        {"Period": "Jan 24", "exposure": 80000, "Rank": 2, "rating": "8"},
+                        {"Period": "Feb 24", "exposure": 95000, "Rank": 2, "rating": "5"}
+                    ]
+                }
+            ]
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'sector' not found in the dataset."}
+        }
+
+@app.get(
+    "/ranked_data_by_period",
+    response_model=RankedDataByPeriodResponse,
+    responses={
+        200: {
+            "description": "Returns ranked data by period for a given fact field and dimension.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic ranked data by period",
+                            "value": [
+                                {
+                                    "Customer ID": 12345,
+                                    "Customer Name": "John Doe",
+                                    "Periods": [
+                                        {"Period": "Jan 24", "exposure": 100000, "Rank": 1, "rating": "1"},
+                                        {"Period": "Feb 24", "exposure": 120000, "Rank": 1, "rating": "10"}
+                                    ]
+                                },
+                                {
+                                    "Customer ID": 67890,
+                                    "Customer Name": "Jane Smith",
+                                    "Periods": [
+                                        {"Period": "Jan 24", "exposure": 80000, "Rank": 2, "rating": "8"},
+                                        {"Period": "Feb 24", "exposure": 95000, "Rank": 2, "rating": "5"}
+                                    ]
+                                }
+                            ]
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Filtered by sector = Retail",
+                            "value": [
+                                {
+                                    "Customer ID": 12345,
+                                    "Customer Name": "John Doe",
+                                    "sector": "Retail",
+                                    "Periods": [
+                                        {"Period": "Jan 24", "exposure": 100000, "Rank": 1, "rating": "1"},
+                                        {"Period": "Feb 24", "exposure": 120000, "Rank": 1, "rating": "10"}
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid inputs or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "fact_field"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "dimension_field_to_rank"], "msg": "field required", "type": "value_error.missing"},
+                            {"loc": ["query", "fact_field"], "msg": "Invalid field name(s): Exposure Amt. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "dimension_field_to_rank"], "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores", "type": "value_error.custom"},
+                            {"loc": ["query", "date"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            {"loc": ["query", "period_type"], "msg": "unexpected value; allowed: 'M', 'Q'", "type": "value_error.enum"},
+                            {"loc": ["query", "start_rank"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "end_rank"], "msg": "value is not a valid integer", "type": "type_error.integer"},
+                            {"loc": ["query", "dimension_filter_field"], "msg": "Invalid field name(s): Segment Name. Use lowercase with underscores", "type": "value_error.custom"}
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Ranked Data by Period",
+    description="Returns ranked data for a given fact field, dimension, and periods (monthly or quarterly) with optional filters."
+)
+def ranked_data_by_period(
+    fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
+    dimension_field_to_rank: str = Query(..., description="Dimension field to rank by (e.g., 'cust_id')"),
+    date: str = Query(..., description="Date (dd/mm/yyyy) to calculate the trend from"),
+    start_rank: int = Query(1, ge=1, description="Start rank for the period"),
+    end_rank: int = Query(10, ge=1, description="End rank for the period"),
+    period_type: str = Query('Q', description="'M' for monthly, 'Q' for quarterly"),
+    lookback: int = Query(5, ge=1, description="Lookback range (number of periods to look back)"),
+    dimension_field: str = Query('rating', description="Dimension field to include (e.g., rating)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Field to filter by (optional)"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value to filter by (optional)")
+):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([dimension_field_to_rank], "dimension_field_to_rank")
+        validate_field_names([dimension_field], "dimension_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        validate_period_type(period_type)
+
+        if not re.match(r"^\d{2}/\d{2}/\d{4}$", date):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.get_ranked_data_by_period(
+            fact_field=fact_field,
+            dimension_field_to_rank=dimension_field_to_rank,
+            date=date,
+            start_rank=start_rank,
+            end_rank=end_rank,
+            period_type=period_type,
+            lookback=lookback,
+            dimension_field=dimension_field,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
