@@ -4,7 +4,7 @@ import calendar
 import logging
 from enum import Enum
 from datetime import datetime, date
-from typing import List, Optional, Union, Dict, Literal ,Any
+from typing import List, Optional, Union, Dict, Literal, Any
 
 import pandas as pd
 import numpy as np
@@ -744,8 +744,8 @@ class RiskDataModel:
     fact_field: str,
     dimension_field_to_rank: str,
     date: str,
-    start_rank: int = 1,
-    end_rank: int = 10,
+    start_rank: Optional[int] = None,
+    end_rank: Optional[int] = None,
     period_type: str = 'Q',
     lookback: int = 5,
     dimension_field: str = 'rating',
@@ -753,7 +753,7 @@ class RiskDataModel:
     dimension_filter_value: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         # Validate rank range
-        if end_rank < start_rank:
+        if end_rank is not None and start_rank is not None and end_rank < start_rank:
             return [{"error": f"end_rank ({end_rank}) must be >= start_rank ({start_rank})."}]
 
         df = self.df_joined.copy()
@@ -790,6 +790,12 @@ class RiskDataModel:
             logger.info(f"After filter ({filt_field}={dimension_filter_value}): {len(df)} records")
             if df.empty:
                 return [{"error": "No data after applying filter. Check values."}]
+
+        # Calculate start and end ranks
+        if start_rank is None:
+            start_rank = int(1)
+        if end_rank is None:
+            end_rank = int(df[dim_rank].nunique())
 
         # Calculate periods and filter
         periods = self._calculate_periods(date, lookback, period_type)
@@ -2763,8 +2769,8 @@ def ranked_data_by_period(
     fact_field: str = Query(..., description="Fact field to aggregate (e.g., exposure)"),
     dimension_field_to_rank: str = Query(..., description="Dimension field to rank by (e.g., 'cust_id')"),
     date: str = Query(..., description="Date (dd/mm/yyyy) to calculate the trend from"),
-    start_rank: int = Query(1, ge=1, description="Start rank for the period"),
-    end_rank: int = Query(10, ge=1, description="End rank for the period"),
+    start_rank: Optional[int] = Query(None, description="Start rank for the period"),
+    end_rank: Optional[int] = Query(None, description="End rank for the period"),
     period_type: str = Query('Q', description="'M' for monthly, 'Q' for quarterly"),
     lookback: int = Query(5, ge=1, description="Lookback range (number of periods to look back)"),
     dimension_field: str = Query('rating', description="Dimension field to include (e.g., rating)"),
