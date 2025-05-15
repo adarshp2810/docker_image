@@ -203,40 +203,49 @@ class RiskDataModel:
             distinct_vals = list(distinct_vals)
         return distinct_vals
 
-    def get_sum_by_dimension(self, fact_fields, group_by_fields=None, date_filter=None, dimension_filter_field=None, dimension_filter_value=None):
-        if self.df_joined is None:
-            return {"error": "No joined data available"}
+    def get_sum_by_dimension(
+        self,
+        fact_field: str,
+        group_by_field: Optional[str] = None,
+        date_filter: Optional[str] = None,
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None
+    ):
         df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
 
+        # Apply date filter
         if date_filter:
-            df = df[df["date"] == date_filter]
+            df = df[df["date"] == pd.to_datetime(date_filter, dayfirst=True)]
 
+        # Apply optional dimension filter
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
+                return {"error": f"Column '{dimension_filter_field}' not found."}
             if dimension_filter_field == "group":
                 df = df[df[dimension_filter_field] == int(dimension_filter_value)]
             else:
-                df = df[df[dimension_filter_field] == dimension_filter_value]
+                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
 
-        numerical_fields = [f for f in fact_fields if pd.api.types.is_numeric_dtype(df[f])]
-        result = []
+        if fact_field not in df.columns:
+            return {"error": f"Fact field '{fact_field}' not found."}
 
-        if group_by_fields:
-            agg_df = df.groupby(group_by_fields)[numerical_fields].sum().reset_index()
-            for field in numerical_fields:
-                agg_df[field] = round(agg_df[field], 0)
+        # Aggregation
+        if group_by_field:
+            if group_by_field not in df.columns:
+                return {"error": f"Group by field '{group_by_field}' not found."}
+            agg_df = df.groupby(group_by_field)[fact_field].sum().reset_index()
+            agg_df[fact_field] = agg_df[fact_field].round(0)
             result = agg_df.to_dict(orient="records")
             if dimension_filter_field and dimension_filter_value:
                 result.insert(0, {dimension_filter_field: dimension_filter_value})
+            return result
         else:
-            sum_series = df[numerical_fields].sum()
-            sum_series = sum_series.round(0).astype(int)
-            result = sum_series.to_dict()
+            total = df[fact_field].sum()
+            result = {fact_field: int(round(total))}
             if dimension_filter_field and dimension_filter_value:
-                result = {dimension_filter_field: dimension_filter_value, **result}
-
-        return result
+                return {dimension_filter_field: dimension_filter_value, **result}
+            return result
 
     def get_avg_by_dimension(self, fact_fields, group_by_fields=None, date_filter=None, dimension_filter_field=None, dimension_filter_value=None):
         if self.df_joined is None:
@@ -1446,23 +1455,21 @@ class ErrorResponse(BaseModel):
     description="Aggregates one or more numeric fact fields, optionally grouped by dimensions and filtered by date or a dimension value."
 )
 def get_sum_by_dimension(
-    fact_fields: str = Query(..., description="Comma-separated list of fact fields to aggregate, e.g., 'exposure,provision'"),
-    group_by_fields: str = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
+    fact_field: str = Query(..., description="Fact field to aggregate, e.g., 'exposure'"),
+    group_by_field: str = Query(None, description="Field to group by, e.g., 'cust_id'"),
     date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
     dimension_filter_field: Optional[str] = Query(None, description="Field name to filter the data by, e.g., 'sector'"),
     dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field to filter by, e.g., 'finance'")
 ):
     try:
-        fact_fields_list  = [field.strip() for field in fact_fields.split(',')]  # Parse fact_fields as a list
-        group_by_fields_list = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
-
-        validate_field_names(fact_fields_list, "fact_fields")
-        validate_field_names(group_by_fields_list, "group_by_fields")
+        validate_field_names([fact_field], "fact_field")
+        if group_by_field:
+            validate_field_names([group_by_field], "group_by_field")
         if dimension_filter_field:
             validate_field_names([dimension_filter_field], "dimension_filter_field")
         result = risk_model.get_sum_by_dimension(
-            fact_fields=fact_fields_list,
-            group_by_fields=group_by_fields_list if group_by_fields else None,
+            fact_field=fact_field,
+            group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
