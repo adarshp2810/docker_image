@@ -95,11 +95,7 @@ def load_data(folder: str, normalize_cols=True):
     if not os.path.exists(folder):
         raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
     
-    all_data = {"fact_risk": [], "customer": [], "risk_limit": []}
-    customer_loaded = False
-    rating_loaded = False
-    customer_df = None
-    rating_df = None
+    all_data = {"fact_risk": [], "customer": [], "risk_limit": [], "rating": []}
 
     for filename in os.listdir(folder):
         if filename.endswith(".xlsx") and not filename.startswith("~$"):
@@ -121,22 +117,12 @@ def load_data(folder: str, normalize_cols=True):
                     df_fact["source_file"] = filename
                     all_data["fact_risk"].append(df_fact)
 
-                if not customer_loaded and "CUSTOMER" in xls.sheet_names:
+                if "CUSTOMER" in xls.sheet_names:
                     df_cust = xls.parse("CUSTOMER")
                     if normalize_cols:
                         df_cust.columns = [str(c).strip().lower().replace(" ", "_") for c in df_cust.columns]
-                    customer_df = df_cust
-                    customer_loaded = True
-
-                if not rating_loaded:
-                    for sheet in xls.sheet_names:
-                        if sheet.strip().lower().startswith("rating and pds"):
-                            df_rating = xls.parse(sheet)
-                            if normalize_cols:
-                                df_rating.columns = [str(c).strip().lower().replace(" ", "_") for c in df_rating.columns]
-                            rating_df = df_rating
-                            rating_loaded = True
-                            break
+                    df_cust["source_file"] = filename
+                    all_data["customer"].append(df_cust)
 
                 if "Risk Limit" in xls.sheet_names:
                     rl = xls.parse("Risk Limit")
@@ -145,15 +131,22 @@ def load_data(folder: str, normalize_cols=True):
                     rl['effective_date'] = eff_date.strftime('%d/%m/%Y')
                     all_data["risk_limit"].append(rl)
 
+                # Load rating sheet 
+                if "PD" in xls.sheet_names:
+                    df_rating = xls.parse("PD")
+                    if normalize_cols:
+                        df_rating.columns = [str(c).strip().lower().replace(" ", "_") for c in df_rating.columns]
+                    df_rating["source_file"] = filename
+                    all_data["rating"].append(df_rating)
+
             except Exception as e:
                 logger.error(f"Error loading {filename}: {e}")
-    if rating_df is None:
-        print("Warning: Rating sheet not found in any of the files.")
+
     merged_data = {
         "fact_risk": pd.concat(all_data["fact_risk"], ignore_index=True) if all_data["fact_risk"] else None,
-        "customer": customer_df if customer_df is not None else pd.DataFrame(),
+        "customer": pd.concat(all_data["customer"], ignore_index=True).drop_duplicates(subset=['cust_id']),
         "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None,
-        "rating": rating_df if rating_df is not None else pd.DataFrame()
+        "rating": pd.concat(all_data["rating"], ignore_index=True) if all_data["rating"] else None
     }
     
     if merged_data["fact_risk"] is not None:
@@ -190,6 +183,21 @@ class RiskDataModel:
             self.df_joined = self.df_joined.drop(columns=["cust_name_y"])
             self.df_joined = self.df_joined.rename(columns={"cust_name_x": "cust_name"})
 
+        self.df_joined["date"] = pd.to_datetime(self.df_joined["date"], errors="coerce", dayfirst=True)
+        self.df_joined["year"] = self.df_joined["date"].dt.year
+
+        self.df_rating["year"] = pd.to_numeric(self.df_rating["year"], errors="coerce")
+
+        self.df_rating = self.df_rating.drop_duplicates(subset=["internal_rating", "year"])
+
+        self.df_joined = pd.merge(
+            self.df_joined,
+            self.df_rating,
+            how="left",
+            left_on=["rating", "year"],
+            right_on=["internal_rating", "year"]
+        )
+
     def get_distinct_values(self, column_name):
         if self.df_joined is None:
             raise ValueError("No joined data available")
@@ -203,49 +211,40 @@ class RiskDataModel:
             distinct_vals = list(distinct_vals)
         return distinct_vals
 
-    def get_sum_by_dimension(
-        self,
-        fact_field: str,
-        group_by_field: Optional[str] = None,
-        date_filter: Optional[str] = None,
-        dimension_filter_field: Optional[str] = None,
-        dimension_filter_value: Optional[str] = None
-    ):
+    def get_sum_by_dimension(self, fact_fields, group_by_fields=None, date_filter=None, dimension_filter_field=None, dimension_filter_value=None):
+        if self.df_joined is None:
+            return {"error": "No joined data available"}
         df = self.df_joined.copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
 
-        # Apply date filter
         if date_filter:
-            df = df[df["date"] == pd.to_datetime(date_filter, dayfirst=True)]
+            df = df[df["date"] == date_filter]
 
-        # Apply optional dimension filter
         if dimension_filter_field and dimension_filter_value:
             if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found."}
+                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
             if dimension_filter_field == "group":
                 df = df[df[dimension_filter_field] == int(dimension_filter_value)]
             else:
-                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
+                df = df[df[dimension_filter_field] == dimension_filter_value]
 
-        if fact_field not in df.columns:
-            return {"error": f"Fact field '{fact_field}' not found."}
+        numerical_fields = [f for f in fact_fields if pd.api.types.is_numeric_dtype(df[f])]
+        result = []
 
-        # Aggregation
-        if group_by_field:
-            if group_by_field not in df.columns:
-                return {"error": f"Group by field '{group_by_field}' not found."}
-            agg_df = df.groupby(group_by_field)[fact_field].sum().reset_index()
-            agg_df[fact_field] = agg_df[fact_field].round(0)
+        if group_by_fields:
+            agg_df = df.groupby(group_by_fields)[numerical_fields].sum().reset_index()
+            for field in numerical_fields:
+                agg_df[field] = round(agg_df[field], 0)
             result = agg_df.to_dict(orient="records")
             if dimension_filter_field and dimension_filter_value:
                 result.insert(0, {dimension_filter_field: dimension_filter_value})
-            return result
         else:
-            total = df[fact_field].sum()
-            result = {fact_field: int(round(total))}
+            sum_series = df[numerical_fields].sum()
+            sum_series = sum_series.round(0).astype(int)
+            result = sum_series.to_dict()
             if dimension_filter_field and dimension_filter_value:
-                return {dimension_filter_field: dimension_filter_value, **result}
-            return result
+                result = {dimension_filter_field: dimension_filter_value, **result}
+
+        return result
 
     def get_avg_by_dimension(self, fact_fields, group_by_fields=None, date_filter=None, dimension_filter_field=None, dimension_filter_value=None):
         if self.df_joined is None:
@@ -874,6 +873,343 @@ class RiskDataModel:
             results.append(entry)
 
         return results
+    
+    def calculate_weighted_average(
+    self,
+    fact_field: str,
+    weight_field: str,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None
+    ) -> Dict[str, float]:
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        if date_filter:
+            date_obj = pd.to_datetime(date_filter, format="%d/%m/%Y")
+            df = df[df["date"] == date_obj]
+
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                return {"error": f"'{dimension_filter_field}' not found in data."}
+            if dimension_filter_field == "group":
+                df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+            else:
+                df = df[df[dimension_filter_field] == str(dimension_filter_value)]
+
+        if fact_field not in df.columns:
+            return {"error": f"'{fact_field}' not found in data."}
+        elif weight_field not in df.columns:
+            return {"error": f"'{weight_field}' not found in data."}
+
+        df[fact_field] = pd.to_numeric(df[fact_field], errors='coerce')
+        df[weight_field] = pd.to_numeric(df[weight_field], errors='coerce')
+
+        if df.empty:
+            return {"error": "No valid data after filtering."}
+
+        total = df[weight_field].sum()
+        if total == 0:
+            return {"error": "Total weight is zero; cannot compute weighted average."}
+
+        df["weight"] = df[weight_field] / total
+        weighted_sum = (df[fact_field] * df["weight"]).sum()
+        weighted_average = weighted_sum / (df["weight"].sum())
+        weighted_average = round(weighted_average, 2)
+
+        result = {fact_field: weighted_average}
+        if dimension_filter_field and dimension_filter_value:
+            result = {dimension_filter_field: dimension_filter_value, **result}
+
+        return result
+    
+    def _format_label(self, date: pd.Timestamp, freq: str) -> str:
+        return date.strftime("%b %Y")  
+
+    def _generate_periods(self, base_date: pd.Timestamp, lookback: int, freq: str) -> List[pd.Timestamp]:
+        periods = []
+        for i in range(lookback + 1):
+            if freq == 'm':
+                period = (base_date - pd.DateOffset(months=i)).replace(day=1)
+            elif freq == "q":  
+                q = (base_date.to_period("Q") - i).to_timestamp(how='end')
+                period = q.replace(day=1)
+            else:
+                raise ValueError("Frequency must be 'm' or 'q'")
+            periods.append(period)
+        return sorted(set(periods))
+
+    def weighted_avg_trend(
+        self,
+        fact_fields: List[str],
+        weight_field: str,
+        date_filter: Optional[str] = None,
+        lookback: int = 5,
+        frequency: str = "q",
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None
+    ) -> Any:
+        df = self.df_joined.copy()
+        frequency = frequency.lower()
+        if frequency not in ['m', 'q']:
+            raise ValueError("Frequency must be M for 'monthly' or Q for 'quarterly'")
+        
+        invalid_fields = [f for f in fact_fields if f not in df.columns]
+        if invalid_fields:
+            raise ValueError(f"Invalid fact field(s): {', '.join(invalid_fields)}")
+
+        if date_filter:
+            try:
+                base_date = pd.to_datetime(date_filter, dayfirst=True, errors="raise")
+            except Exception:
+                raise HTTPException(status_code=404, detail=f"Invalid date '{date_filter}'. Use 'DD/MM/YYYY'.")
+        else:
+            base_date = pd.Timestamp.today()
+
+        periods = self._generate_periods(base_date, lookback, frequency)
+
+        # Apply dimension filter if provided
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                raise HTTPException(status_code=404, detail=f"Invalid dimension_filter_field '{dimension_filter_field}'. Valid columns: {', '.join(df.columns)}")
+            try:
+                if dimension_filter_field in ["group", "group id", "cust id"]:
+                    val = int(dimension_filter_value)
+                else:
+                    val = dimension_filter_value
+                df = df[df[dimension_filter_field] == val]
+            except Exception:
+                raise HTTPException(status_code=404, detail=f"Invalid dimension_filter_value '{dimension_filter_value}' for field '{dimension_filter_field}'")
+
+        if weight_field not in df.columns:
+            raise ValueError(f"Weight field '{weight_field}' not found. Valid columns: {', '.join(df.columns)}")
+
+        # Initialize metrics dictionary
+        metrics = {}
+
+        # Calculate metrics for each period
+        for p in periods:
+            if frequency == 'm':
+                subset = df[(df["date"].dt.year == p.year) & (df["date"].dt.month == p.month)]
+            else:  # quarterly
+                subset = df[df["date"].dt.to_period("Q") == p.to_period("Q")]
+
+            label = self._format_label(p, frequency)
+            metrics[label] = {}
+
+            for field in fact_fields:
+                if field not in df.columns:
+                    metrics[label][field] = 0
+                    continue
+
+                total_w = pd.to_numeric(subset[weight_field], errors="coerce").sum()
+                if subset.empty or total_w == 0 or pd.isna(total_w):
+                    metrics[label][field] = 0
+                else:
+                    weighted_sum = (
+                        pd.to_numeric(subset[field], errors="coerce") *
+                        pd.to_numeric(subset[weight_field], errors="coerce")
+                    ).sum()
+                    avg = weighted_sum / total_w
+                    metrics[label][field] = round(avg, 2) if field in ("pd", "rating") else round(avg, 6)
+
+        # Prepare the result
+        if dimension_filter_field and dimension_filter_value:
+            filter_str = f"{dimension_filter_field}:{dimension_filter_value}"
+            result = [filter_str, metrics]
+        else:
+            result = metrics
+
+        return result
+    
+    def get_aggregated_metrics_by_field(
+        self,
+        metrics: str,
+        group_by_field: Optional[str] = None,
+        date_filter: Optional[str] = None,
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None,
+        additional_field: Optional[str] = None
+    ):
+        df = self.df_joined.copy()
+
+        # Parse metrics string
+        metrics_dict = {}
+        for metric in metrics.split(','):
+            parts = metric.strip().split(':')
+            if len(parts) != 2:
+                raise HTTPException(status_code=404, detail=f"Invalid metric format: '{metric}' (expected 'field:aggregation')")
+            field, agg_type = parts
+            metrics_dict[field.strip()] = agg_type.strip()
+
+        # Apply date filter
+        if date_filter:
+            df['date'] = pd.to_datetime(df['date'], errors="coerce", dayfirst=True)
+            filter_date = pd.to_datetime(date_filter, dayfirst=True).date()
+            df = df[df["date"].dt.date == filter_date]
+
+        # Apply dimension filter
+        if dimension_filter_field and dimension_filter_value:
+            if dimension_filter_field not in df.columns:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Dimension filter field '{dimension_filter_field}' not found in dataset."
+                )
+            try:
+                val = int(dimension_filter_value) if dimension_filter_field == "group" else dimension_filter_value
+                df = df[df[dimension_filter_field] == val]
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid dimension filter value '{dimension_filter_value}' for field '{dimension_filter_field}'"
+                )
+
+            if df.empty:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No data found for the provided filters."
+                )
+
+        # Convert metric fields to numeric
+        for field in metrics_dict:
+            if field in df.columns:
+                df[field] = pd.to_numeric(df[field], errors='coerce')
+
+        # Grouped Aggregation
+        if group_by_field:
+            if group_by_field not in df.columns:
+                return {"error": f"Group by field '{group_by_field}' not found."}
+
+            grouped = df.groupby(group_by_field)
+            result_list = []
+
+            for group_val, group_df in grouped:
+                row = {group_by_field: group_val}
+                for field, agg_type in metrics_dict.items():
+                    if field not in group_df.columns:
+                        row[field] = None
+                        continue
+
+                    if agg_type == "sum":
+                        value = group_df[field].sum()
+                    elif agg_type == "count":
+                        value = group_df[field].nunique()
+                    elif agg_type == "mean":
+                        value = group_df[field].mean()
+                    elif agg_type == "weighted_average":
+                        weight_field = "exposure"
+                        if weight_field not in group_df.columns:
+                            value = None
+                        else:
+                            w_sum = group_df[weight_field].sum()
+                            value = (group_df[field] * group_df[weight_field]).sum() / w_sum if w_sum != 0 else 0
+                    else:
+                        raise HTTPException(status_code=422, detail=f"Unsupported aggregation type: {agg_type}")
+
+                    if isinstance(value, (np.integer, np.int64)):
+                        value = int(value)
+                    elif isinstance(value, (np.floating, np.float64)):
+                        value = round(float(value), 2)
+                    row[field] = value
+
+                if additional_field and additional_field in group_df.columns:
+                    extra = group_df[additional_field].dropna().iloc[0] if not group_df[additional_field].dropna().empty else None
+                    if isinstance(extra, (np.integer, np.int64)):
+                        extra = int(extra)
+                    elif isinstance(extra, (np.floating, np.float64)):
+                        extra = float(extra)
+                    row[additional_field] = extra
+
+                result_list.append(row)
+
+            # Build full index of all possible group_by_field values
+            if group_by_field == "rating":
+                all_vals = sorted(self.df_rating["internal_rating"].dropna().unique())
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field == "group":
+                all_vals = sorted(self.df_customer["group_id"].dropna().unique().astype(int))
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            elif group_by_field in self.df_customer.columns:
+                all_vals = self.df_customer[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+            else:
+                all_vals = df[group_by_field].dropna().unique()
+                full_index = pd.DataFrame({group_by_field: all_vals})
+
+            # Merge full index with result
+            result_df = pd.DataFrame(result_list)
+            final_df = pd.merge(full_index, result_df, on=group_by_field, how="left")
+
+            # Fill missing values with 0 for numeric columns
+            for col in final_df.columns:
+                if col != group_by_field and pd.api.types.is_numeric_dtype(final_df[col]):
+                    final_df[col] = final_df[col].fillna(0).round(2)
+
+            result = final_df.to_dict(orient="records")
+
+            # Prepend dimension filter field
+            if dimension_filter_field and dimension_filter_value:
+                header = {
+                    dimension_filter_field: (
+                        int(dimension_filter_value)
+                        if dimension_filter_field == "group"
+                        else dimension_filter_value
+                    )
+                }
+                return [header] + result
+            else:
+                return result
+
+        # Flat Aggregation
+        else:
+            result = {}
+            for field, agg_type in metrics_dict.items():
+                if field not in df.columns:
+                    result[field] = None
+                    continue
+
+                if agg_type == "sum":
+                    value = df[field].sum()
+                elif agg_type == "count":
+                    value = df[field].nunique()
+                elif agg_type == "mean":
+                    value = df[field].mean()
+                elif agg_type == "weighted_average":
+                    weight_field = "exposure"
+                    if weight_field not in df.columns:
+                        value = None
+                    else:
+                        w_sum = df[weight_field].sum()
+                        value = (df[field] * df[weight_field]).sum() / w_sum if w_sum != 0 else 0
+                else:
+                    raise HTTPException(status_code=422, detail=f"Unsupported aggregation type: {agg_type}")
+
+                if isinstance(value, (np.integer, np.int64)):
+                    value = int(value)
+                elif isinstance(value, (np.floating, np.float64)):
+                    value = round(float(value), 2)
+
+                result[field] = value
+
+            if additional_field and additional_field in df.columns:
+                extra = df[additional_field].dropna().iloc[0] if not df[additional_field].dropna().empty else None
+                if isinstance(extra, (np.integer, np.int64)):
+                    extra = int(extra)
+                elif isinstance(extra, (np.floating, np.float64)):
+                    extra = float(extra)
+                result[additional_field] = extra
+
+            if dimension_filter_field and dimension_filter_value:
+                result = {
+                    dimension_filter_field: (
+                        int(dimension_filter_value)
+                        if dimension_filter_field == "group"
+                        else dimension_filter_value
+                    ),
+                    **result
+                }
+
+            return result
 
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
@@ -1455,21 +1791,23 @@ class ErrorResponse(BaseModel):
     description="Aggregates one or more numeric fact fields, optionally grouped by dimensions and filtered by date or a dimension value."
 )
 def get_sum_by_dimension(
-    fact_field: str = Query(..., description="Fact field to aggregate, e.g., 'exposure'"),
-    group_by_field: str = Query(None, description="Field to group by, e.g., 'cust_id'"),
+    fact_fields: str = Query(..., description="Comma-separated list of fact fields to aggregate, e.g., 'exposure,provision'"),
+    group_by_fields: str = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
     date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
     dimension_filter_field: Optional[str] = Query(None, description="Field name to filter the data by, e.g., 'sector'"),
     dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field to filter by, e.g., 'finance'")
 ):
     try:
-        validate_field_names([fact_field], "fact_field")
-        if group_by_field:
-            validate_field_names([group_by_field], "group_by_field")
+        fact_fields_list  = [field.strip() for field in fact_fields.split(',')]  # Parse fact_fields as a list
+        group_by_fields_list = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
+
+        validate_field_names(fact_fields_list, "fact_fields")
+        validate_field_names(group_by_fields_list, "group_by_fields")
         if dimension_filter_field:
             validate_field_names([dimension_filter_field], "dimension_filter_field")
         result = risk_model.get_sum_by_dimension(
-            fact_field=fact_field,
-            group_by_field=group_by_field,
+            fact_fields=fact_fields_list,
+            group_by_fields=group_by_fields_list if group_by_fields else None,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
@@ -2825,6 +3163,505 @@ def ranked_data_by_period(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+# --- Success Response Model ---
+class WeightedAverageResponse(RootModel[Dict[str, Union[float, str]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "sector": "Retail",
+                "rating": 3.76
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Total weight is zero; cannot compute weighted average."
+            }
+        }
+
+@app.get(
+    "/weighted_average",
+    response_model=WeightedAverageResponse,
+    responses={
+        200: {
+            "description": "Successful weighted average result.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic weighted average",
+                            "value": {
+                                "rating": 3.76
+                            }
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Weighted average filtered by sector = Retail",
+                            "value": {
+                                "sector": "Retail",
+                                "rating": 3.91
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Returned when no valid data or weight is zero.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "No Data After Filter": {
+                            "summary": "Filter returned no rows",
+                            "value": {
+                                "error": "No valid data after filtering."
+                            }
+                        },
+                        "Zero Weight": {
+                            "summary": "Sum of weight_field is zero",
+                            "value": {
+                                "error": "Total weight is zero; cannot compute weighted average."
+                            }
+                        },
+                        "Missing Column": {
+                            "summary": "Fact or weight field not in dataset",
+                            "value": {
+                                "error": "'exposure' or 'weighting' not found in data."
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error (bad field name or date format).",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Invalid Field Name": {
+                            "summary": "Uppercase or space in field name",
+                            "value": {
+                                "detail": [
+                                    {
+                                        "loc": ["query", "fact_field"],
+                                        "msg": "Invalid field name(s): Rating Score. Use lowercase and underscores.",
+                                        "type": "value_error.custom"
+                                    }
+                                ]
+                            }
+                        },
+                        "Invalid Date Format": {
+                            "summary": "Wrong date format",
+                            "value": {
+                                "detail": [
+                                    {
+                                        "loc": ["query", "date_filter"],
+                                        "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                        "type": "value_error.date"
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    summary="Calculate Weighted Average",
+    description="Computes the weighted average of a fact field using a weight field, with optional date and dimension filters."
+)
+def calculate_weighted_average(
+    fact_field: str = Query(..., description="Field to compute weighted average (e.g., 'rating')"),
+    weight_field: str = Query(..., description="Field used as weights (e.g., 'exposure')"),
+    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format (optional)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional dimension field to filter by"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional value for the filter field")
+):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        validate_field_names([weight_field], "weight_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.calculate_weighted_average(
+            fact_field=fact_field,
+            weight_field=weight_field,
+            date_filter=date_filter,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+# --- Success Response Model ---
+WeightedTrendResponse = RootModel[
+    Union[
+        Dict[str, Dict[str, float]],
+        List[Union[str, Dict[str, Dict[str, float]]]]
+    ]
+]
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., example="Weight field 'exposure' not found.")
+
+# --- Frequency Validator ---
+def validate_frequency(freq: str):
+    if freq.lower() not in ["m", "q"]:
+        raise HTTPException(
+            status_code=422,
+            detail=[{
+                "loc": ["query", "frequency"],
+                "msg": "Invalid frequency. Must be 'm' for monthly or 'q' for quarterly.",
+                "type": "value_error.enum"
+            }]
+        )
+
+@app.get(
+    "/weighted_average_trend",
+    response_model=WeightedTrendResponse,
+    responses={
+        200: {
+            "description": "Returns weighted average trend by period.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Basic weighted trend",
+                            "value": {
+                                "Jan 2024": {"rating": 3.8, "pd": 0.002341},
+                                "Apr 2024": {"rating": 3.9, "pd": 0.002189}
+                            }
+                        },
+                        "With Filter": {
+                            "summary": "With sector filter",
+                            "value": [
+                                "sector:Retail",
+                                {
+                                    "Jan 2024": {"rating": 4.0},
+                                    "Apr 2024": {"rating": 4.1}
+                                }
+                            ]
+                        }
+                    }
+                }
+            } 
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No valid data after filtering or total weight zero across all periods",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Empty Dataset": {
+                            "summary": "Filter returned no records",
+                            "value": {"error": "No valid data found for given parameters."}
+                        },
+                        "Missing Weight Field": {
+                            "summary": "Weight column doesn't exist",
+                            "value": {"error": "Weight field 'exposure' not found."}
+                        }
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation errors (field name, date format, frequency)",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Invalid Field": {
+                            "summary": "Bad format for field name",
+                            "value": {
+                                "detail": [
+                                    {
+                                        "loc": ["query", "fact_field"],
+                                        "msg": "Invalid field name(s): Rating Score. Use lowercase and underscores.",
+                                        "type": "value_error.custom"
+                                    }
+                                ]
+                            }
+                        },
+                        "Invalid Frequency": {
+                            "summary": "Frequency must be 'm' or 'q'",
+                            "value": {
+                                "detail": [
+                                    {
+                                        "loc": ["query", "frequency"],
+                                        "msg": "Invalid frequency. Must be 'm' for monthly or 'q' for quarterly.",
+                                        "type": "value_error.enum"
+                                    }
+                                ]
+                            }
+                        },
+                        "Invalid Date": {
+                            "summary": "Bad date format",
+                            "value": {
+                                "detail": [
+                                    {
+                                        "loc": ["query", "date_filter"],
+                                        "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                                        "type": "value_error.date"
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    summary="Weighted Average Trend",
+    description="Computes a trend of weighted averages over monthly or quarterly periods with optional filtering."
+)
+def weighted_average_trend(
+    fact_field: str = Query(..., description="Comma-separated fact fields (e.g., 'rating,pd')"),
+    weight_field: str = Query(..., description="Field for weights (e.g., 'exposure')"),
+    date_filter: Optional[str] = Query(None, description="Date in DD/MM/YYYY"),
+    lookback: int = Query(5, description="How many periods (months/quarters) to look back"),
+    frequency: str = Query("q", description="'m' for monthly, 'q' for quarterly"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional field to filter by"),
+    dimension_filter_value: Optional[str] = Query(None, description="Value to filter by")
+):
+    try:
+        # --- Validations ---
+        fields = [f.strip().lower() for f in fact_field.split(",") if f.strip()]
+        validate_field_names(fields, "fact_field")
+        validate_field_names([weight_field], "weight_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        validate_frequency(frequency)
+
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        result = risk_model.weighted_avg_trend(
+            fact_fields=fields,
+            weight_field=weight_field.lower(),
+            date_filter=date_filter,
+            lookback=lookback,
+            frequency=frequency.lower(),
+            dimension_filter_field=(dimension_filter_field.lower() if dimension_filter_field else None),
+            dimension_filter_value=dimension_filter_value
+        )
+
+        # Handle no data cases
+        if isinstance(result, dict) and all(v == {} for v in result.values()):
+            raise HTTPException(status_code=404, detail="No valid data found for given parameters.")
+        if isinstance(result, list) and isinstance(result[1], dict) and all(v == {} for v in result[1].values()):
+            raise HTTPException(status_code=404, detail="No valid data found for given parameters.")
+
+        return result
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# --- Success model ---
+AggregatedMetricsResponse = RootModel[
+    Union[
+        Dict[str, Union[float, int, str]],
+        List[Dict[str, Union[str, float, int]]]
+    ]
+]
+
+# --- Error model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., example="Unsupported aggregation type: max")
+
+def validate_field_name(field: str, name: str):
+    if not field.islower() or " " in field:
+        raise HTTPException(
+            status_code=422,
+            detail=[{
+                "loc": ["query", name],
+                "msg": f"Invalid field name '{field}'. Use lowercase and underscores.",
+                "type": "value_error.custom"
+            }]
+        )
+    
+def validate_metrics(metrics_str: str):
+    valid_aggs = {"sum", "mean", "count", "weighted_average"}
+    invalid = []
+    for item in metrics_str.split(","):
+        parts = item.strip().split(":")
+        if len(parts) != 2 or parts[1] not in valid_aggs:
+            invalid.append(item)
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=[{
+                "loc": ["query", "metrics"],
+                "msg": f"Invalid metric(s): {', '.join(invalid)}. Format should be 'field:agg' with agg in {valid_aggs}",
+                "type": "value_error.custom"
+            }]
+        )
+
+@app.get(
+    "/aggregated_metrics_by_field",
+    response_model=AggregatedMetricsResponse,
+    responses={
+        200: {
+            "description": "Aggregated results by group or as a flat record",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Grouped by rating": {
+                            "summary": "Metrics grouped by rating",
+                            "value": [
+                                {"rating": "AAA", "exposure": 150000, "pd": 0.0012},
+                                {"rating": "AA", "exposure": 120000, "pd": 0.0019}
+                            ]
+                        },
+                        "Flat with Filter": {
+                            "summary": "Flat result with sector filter",
+                            "value": {
+                                "sector": "Retail",
+                                "exposure": 270000,
+                                "pd": 0.0021
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No data matched the given filters",
+            "content": {
+                "application/json": {
+                    "example": {"error": "No data found for the provided filters."}
+                }
+            }
+        },
+        422: {
+            "description": "Invalid metric format or field names",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "metrics"],
+                                "msg": "Invalid metric(s): exposure:max. Format should be 'field:agg' with agg in {'sum', 'mean', 'count', 'weighted_average'}",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Business rule errors",
+            "content": {
+                "application/json": {
+                    "example": {"error": "Field 'group' not in data."}
+                }
+            }
+        },
+        500: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal errors",
+            "content": {
+                "application/json": {
+                    "example": {"error": "Internal error: unexpected NoneType"}
+                }
+            }
+        }
+    },
+    summary="Get Aggregated Metrics by Field",
+    description="Aggregates one or more metrics grouped optionally by a field, with support for filters and weighted averages."
+)
+def aggregated_metrics_by_field(
+    metrics: str = Query(..., description="Metrics with aggregation types, e.g., 'exposure:sum,pd:mean'"),
+    group_by_field: Optional[str] = Query(None, description="Group by this field (e.g., 'rating')"),
+    date_filter: Optional[str] = Query(None, description="Filter data by date in dd/mm/yyyy"),
+    dimension_filter_field: Optional[str] = Query(None, description="Filter field (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Filter value (e.g., 'Retail')"),
+    additional_field: Optional[str] = Query(None, description="Additional field to return (no aggregation)")
+):
+    try:
+        # --- Field and format validations ---
+        validate_metrics(metrics)
+        for f in metrics.split(","):
+            validate_field_name(f.split(":")[0], "metrics")
+
+        if group_by_field:
+            validate_field_name(group_by_field, "group_by_field")
+        if dimension_filter_field:
+            validate_field_name(dimension_filter_field, "dimension_filter_field")
+        if additional_field:
+            validate_field_name(additional_field, "additional_field")
+
+        # --- Date format check ---
+        if date_filter and not re.match(r"^\d{2}/\d{2}/\d{4}$", date_filter):
+            raise HTTPException(
+                status_code=422,
+                detail=[{
+                    "loc": ["query", "date_filter"],
+                    "msg": "invalid date format, expected 'dd/mm/yyyy'",
+                    "type": "value_error.date"
+                }]
+            )
+
+        # --- Compute result ---
+        result = risk_model.get_aggregated_metrics_by_field(
+            metrics=metrics,
+            group_by_field=group_by_field,
+            date_filter=date_filter,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value,
+            additional_field=additional_field
+        )
+
+        if isinstance(result, dict) and not result:
+            raise HTTPException(status_code=404, detail="No data found for the provided filters.")
+        if isinstance(result, list) and all(not row for row in result[1:] if isinstance(row, dict)):
+            raise HTTPException(status_code=404, detail="No data found for the provided filters.")
+
+        return result
+
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
