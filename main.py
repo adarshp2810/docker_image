@@ -1792,29 +1792,35 @@ class ErrorResponse(BaseModel):
 )
 def get_sum_by_dimension(
     fact_fields: str = Query(..., description="Comma-separated list of fact fields to aggregate, e.g., 'exposure,provision'"),
-    group_by_fields: str = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
+    group_by_fields: Optional[str] = Query(None, description="Comma-separated list of fields to group by, e.g., 'cust_id'"),
     date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
     dimension_filter_field: Optional[str] = Query(None, description="Field name to filter the data by, e.g., 'sector'"),
     dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension field to filter by, e.g., 'finance'")
 ):
     try:
-        fact_fields_list  = [field.strip() for field in fact_fields.split(',')]  # Parse fact_fields as a list
+        fact_fields_list  = [field.strip() for field in fact_fields.split(',')]
         group_by_fields_list = [field.strip() for field in group_by_fields.split(',')] if group_by_fields else None
 
         validate_field_names(fact_fields_list, "fact_fields")
-        validate_field_names(group_by_fields_list, "group_by_fields")
+
+        if group_by_fields_list:  # ✅ Check if not None
+            validate_field_names(group_by_fields_list, "group_by_fields")
+
         if dimension_filter_field:
             validate_field_names([dimension_filter_field], "dimension_filter_field")
+
         result = risk_model.get_sum_by_dimension(
             fact_fields=fact_fields_list,
-            group_by_fields=group_by_fields_list if group_by_fields else None,
+            group_by_fields=group_by_fields_list,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
+
         if isinstance(result, dict) and "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])
         return result
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
