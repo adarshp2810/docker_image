@@ -367,7 +367,7 @@ class RiskDataModel:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
-        fields = {"group", "group_id", "cust_id","rating","internal_rating"}
+        fields = {"group", "group_id", "cust_id"}
         # Validate fact_fields
         if fact_fields:
             for field in fact_fields:
@@ -383,7 +383,7 @@ class RiskDataModel:
                 if group_field not in df.columns:
                     raise ValueError(f"Group by field '{group_field}'is not found.")
                 
-                if pd.api.types.is_numeric_dtype(df[group_field]) and group_field not in fields:
+                if pd.api.types.is_numeric_dtype(df[group_field]) and group_field not in fields and group_field != "rating":
                     raise ValueError(f"Numeric field '{group_field}' is not allowed as a group by field.")
 
         # date filter
@@ -1675,13 +1675,13 @@ class RiskDataModel:
         return result
     
     def get_aggregated_metrics_by_field(
-        self,
-        metrics: str,
-        group_by_field: Optional[str] = None,
-        date_filter: Optional[str] = None,
-        dimension_filter_field: Optional[str] = None,
-        dimension_filter_value: Optional[str] = None,
-        additional_field: Optional[str] = None):
+    self,
+    metrics: str,
+    group_by_field: Optional[str] = None,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None,
+    additional_field: Optional[str] = None):
 
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
@@ -3057,7 +3057,7 @@ def get_sum_by_dimension(
 class GroupedAvgRecord(RootModel[List[Dict[str, Union[str, int, float]]]]):
     class Config:
         json_schema_extra = {
-            "examples": [{  "sector": "Chemicals", "exposure": 101573364,"provision": 201811},
+            "examples": [{"sector": "Chemicals", "exposure": 101573364,"provision": 201811},
                          {"sector": "Consumer Staples","exposure": 105583832,"provision": 10359582},
                          {"sector": "Financials","exposure": 108139973,"provision": 41866895},
                          {"sector": "Industrials","exposure": 175477898,"provision": 79002909},
@@ -3096,7 +3096,7 @@ class ErrorResponse(BaseModel):
                         "Grouped Average": {
                             "summary": "Grouped by sector",
                             "value": [
-                                {  "sector": "Chemicals", "exposure": 101573364,"provision": 201811},
+                                {"sector": "Chemicals", "exposure": 101573364,"provision": 201811},
                                 {"sector": "Consumer Staples","exposure": 105583832,"provision": 10359582},
                                 {"sector": "Financials","exposure": 108139973,"provision": 41866895},
                                 {"sector": "Industrials","exposure": 175477898,"provision": 79002909},
@@ -3219,6 +3219,7 @@ def get_avg_by_dimension(
         group_by_fields_list = []
         if group_by_fields:
             group_by_fields_list = [g.strip() for g in group_by_fields.split(',')]
+            validate_field_names(group_by_fields_list, "group_by_fields")
 
         if dimension_filter_field:
             validate_field_names([dimension_filter_field], "dimension_filter_field")
@@ -4802,7 +4803,7 @@ def weighted_average_trend(
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
 # --- Success Response Model ---
-class AggregatedMetricsResponse( RootModel[Union[Dict[str, float], List[Dict[str, float]]]]):
+class AggregatedMetricsResponse( RootModel[List[Dict[str, Union[str, float, int]]]]):
     class Config:
         json_schema_extra = {
             "example": [{"rating": 1,"exposure": 549773740,"pd": 0},{"rating": 2,"exposure": 1369028386,"pd": 0.02},
@@ -4916,14 +4917,14 @@ def aggregated_metrics_by_field(
     try:
         validate_metrics(metrics)
         for f in metrics.split(","):
-            validate_field_names(f.split(":")[0], "metrics")
+            validate_field_names([f.split(":")[0]], "metrics")
 
         if group_by_field:
-            validate_field_names(group_by_field, "group_by_field")
+            validate_field_names([group_by_field], "group_by_field")
         if dimension_filter_field:
-            validate_field_names(dimension_filter_field, "dimension_filter_field")
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
         if additional_field:
-            validate_field_names(additional_field, "additional_field")
+            validate_field_names([additional_field], "additional_field")
             
         result = risk_model.get_aggregated_metrics_by_field(
             metrics=metrics,
