@@ -294,7 +294,7 @@ class RiskDataModel:
 
         df = self.df_joined.copy()
         
-        fields = {"group", "group_id", "cust_id","rating"}
+        fields = {"group", "group_id", "cust_id","rating","internal_rating"}
         if  fact_field:
             if fact_field not in df.columns:
                 raise ValueError(f"Fact field '{fact_field}' is not found.")
@@ -340,7 +340,7 @@ class RiskDataModel:
             else:
                 raise ValueError("Dimension filter value is missing for the given dimension filter.")
              
-
+        if group_by_field:
             agg_df = df.groupby(group_by_field)[fact_field].sum().reset_index()
             agg_df[fact_field] = agg_df[fact_field].round(0)
             result = agg_df.to_dict(orient="records")
@@ -367,7 +367,7 @@ class RiskDataModel:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
-        fields = {"group", "group_id", "cust_id","rating"}
+        fields = {"group", "group_id", "cust_id","rating","internal_rating"}
         # Validate fact_fields
         if fact_fields:
             for field in fact_fields:
@@ -2296,6 +2296,86 @@ class RiskDataModel:
         result["values"] = matrix.values.tolist()
 
         return result
+    
+    def get_coverage_ratio(
+    self,
+    numerator_field: str = "total_hc_collateral",
+    denominator_field: str = "exposure",
+    group_by_field: Optional[str] = None,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None
+    ):
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        df = self.df_joined.copy()
+
+        # Validate fields
+        for field in [numerator_field, denominator_field]:
+            if field not in df.columns:
+                raise ValueError(f"Field '{field}' is not found in the dataset.")
+
+        if group_by_field and group_by_field not in df.columns:
+            raise ValueError(f"Group by field '{group_by_field}' is not found in the dataset.")
+
+        if dimension_filter_field:
+            if dimension_filter_field not in df.columns:
+                raise ValueError(f"Dimension filter field '{dimension_filter_field}' is not found in the dataset.")
+            if dimension_filter_value is None:
+                raise ValueError("Dimension filter value is missing for the given dimension filter field.")
+
+        # Apply date filter
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        if date_filter:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+            df = df[df["date"] == date_obj]
+
+        # Apply dimension filter
+        if dimension_filter_field and dimension_filter_value:
+            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]):
+                df = df[df[dimension_filter_field] == pd.to_numeric(dimension_filter_value, errors='coerce')]
+            else:
+                df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+
+            if df.empty:
+                raise FileNotFoundError("No data available after applying filters.")
+
+        if group_by_field:
+            grouped = df.groupby(group_by_field).agg(
+                numerator_sum=(numerator_field, 'sum'),
+                denominator_sum=(denominator_field, 'sum')
+            ).reset_index()
+
+            grouped["coverage_ratio"] = grouped.apply(
+                lambda row: round((row["numerator_sum"] / row["denominator_sum"]) * 100, 2)
+                if row["denominator_sum"] != 0 else None, axis=1
+            )
+
+            result = grouped[[group_by_field, "coverage_ratio"]].to_dict(orient="records")
+
+            if not result:
+                raise FileNotFoundError("No data available after applying filters and calculations.")
+
+            if dimension_filter_field and dimension_filter_value:
+                result.insert(0, {dimension_filter_field: dimension_filter_value})
+
+            return result
+
+        else:
+            numerator_sum = df[numerator_field].sum()
+            denominator_sum = df[denominator_field].sum()
+
+            if denominator_sum == 0:
+                raise FileNotFoundError("No valid denominator found to compute coverage ratio.")
+
+            coverage_ratio = round((numerator_sum / denominator_sum) * 100, 2)
+
+            result = {"coverage_ratio": coverage_ratio}
+            if dimension_filter_field and dimension_filter_value:
+                result = {dimension_filter_field: dimension_filter_value, **result}
+
+            return result
 
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
@@ -5715,6 +5795,149 @@ def transition_matrix(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
+class CoverageRatioGroupResult(RootModel[List[Dict[str, Union[str, float]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {"sector": "Financials", "coverage_ratio": 85.23},
+                {"sector": "Industrials", "coverage_ratio": 74.56},
+                {"sector": "Utilities", "coverage_ratio": 95.12}
+            ]
+        }
+
+class CoverageRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "sector": "Financials",
+                "coverage_ratio": 85.23
+            }
+        }
+
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Dimension filter value is missing for the given dimension filter field."
+            }
+        }
+
+@app.get(
+    "/coverage_ratio",
+    response_model=Union[CoverageRatioGroupResult, CoverageRatioSingleResult],
+    responses={
+        200: {
+            "description": "Returns coverage ratio for total_hc_collateral over exposure, optionally grouped by a dimension.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Grouped Result": {
+                            "summary": "Coverage ratios by sector",
+                            "value": [
+                                {"sector": "Financials", "coverage_ratio": 85.23},
+                                {"sector": "Industrials", "coverage_ratio": 74.56},
+                                {"sector": "Utilities", "coverage_ratio": 95.12}
+                            ]
+                        },
+                        "Single Result": {
+                            "summary": "Single overall coverage ratio",
+                            "value": {
+                                "coverage_ratio": 85.23
+                            }
+                        },
+                        "With Filter": {
+                            "summary": "Coverage ratio with sector filter",
+                            "value": {
+                                "sector": "Financials",
+                                "coverage_ratio": 85.23
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Bad request — unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or calculation result not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No valid denominator found to compute coverage ratio."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error — invalid inputs, fields, or formats.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "group_by_field"],
+                                "msg": "Invalid field name(s): Sector Name. Use lowercase with underscores.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "Invalid field name(s): Sector Name. Use lowercase with underscores.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_value"],
+                                "msg": "Dimension filter value is missing for the given dimension filter field.",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '32/13/2024'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Calculate Coverage Ratio",
+    description="Computes sum(total_hc_collateral) / sum(exposure) with optional filters and groupings."
+)
+def coverage_ratio_endpoint(
+    group_by_field: Optional[str] = Query(None, description="Optional group by field (e.g., 'sector')"),
+    date_filter: Optional[str] = Query(None, description="Optional date filter (dd/mm/yyyy)"),
+    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'Financials')")
+):
+    try:
+        result = risk_model.get_coverage_ratio(
+            numerator_field="total_hc_collateral",
+            denominator_field="exposure",
+            group_by_field=group_by_field,
+            date_filter=date_filter,
+            dimension_filter_field=dimension_filter_field,
+            dimension_filter_value=dimension_filter_value
+        )
+        return result
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
