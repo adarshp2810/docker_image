@@ -6392,7 +6392,8 @@ class ErrorResponse(BaseModel):
     }
 )
 def get_top_collaterals(
-    type: str = Query(..., description="Collateral type (e.g., 'Collateral Land & Building', 'Shares')"),
+    type: str = Query(..., description="Collateral type (e.g., 'Collatral Land & Building', 'Collatral Shares & Other Paper Assests
+')"),
     date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2022')"),
     top_n: Optional[int] = Query(None, description="Maximum number of top items to return")
 ):
