@@ -659,10 +659,11 @@ class RiskDataModel:
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         if date_filter:
             try:
-                date_obj = pd.to_datetime(date_filter, dayfirst=True)
-                df = df[df["date"] == date_obj]
+                selected_date = pd.to_datetime(date_filter, dayfirst=True)
             except Exception:
                 raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+        else:
+            selected_date = df["date"].max() 
             
         if period_type not in ("M", "Q"):
             raise ValueError(f"Unexpected value;Only 'M' (monthly) or 'Q' (quarterly) are allowed.")
