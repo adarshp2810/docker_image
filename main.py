@@ -2437,70 +2437,60 @@ class RiskDataModel:
         df = self.df_collateral_joined.copy()
         df = df[(df["collateral_type"] == category_level) & (df["date"] == date_obj)]
 
-        if df.empty:
-            if sub_category_level:
-                valid_subsub = sorted(
-                    self.df_collateral_joined[
-                        (self.df_collateral_joined["collateral_type"] == category_level) &
-                        (self.df_collateral_joined["collateral_category"] == sub_category_level)
-                    ]["collateral_sub-category"].dropna().unique()
-                )
-                return {
-                    **{s.lower().replace(" ", "_"): 0 for s in valid_subsub},
-                    "title": f"Collateral Distribution by Sub-Category ({sub_category_level})"
-                }
-            valid_categories = sorted(
-                self.df_collateral_joined[
-                    self.df_collateral_joined["collateral_type"] == category_level
-                ]["collateral_category"].dropna().unique()
-            )
-            return {
-                **{c.lower().replace(" ", "_"): 0 for c in valid_categories},
-                "title": f"Collateral Distribution by Category ({category_level})"
-            }
-
         if apply_haircut:
             df["adjusted_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
         else:
             df["adjusted_collateral_value"] = df["collateral_value"]
 
+        # ✅ Handle empty case
+        if df.empty:
+            return {
+                "collateral_parent_type": sub_category_level or category_level,
+                "data": []
+            }
+
+        # ✅ Sub-category provided: breakdown by collateral_sub-category
         if sub_category_level:
             sub_df = df[df["collateral_category"] == sub_category_level]
 
             if "collateral_sub-category" not in sub_df.columns:
-                logger.error("Missing 'collateral_sub_category' in sub_df.")
-                logger.warning(f"sub_df columns: {sub_df.columns.tolist()}")
-                raise ValueError("Missing 'collateral_sub_category' in the filtered data.")
+                logger.error("Missing 'collateral_sub-category' in sub_df.")
+                raise ValueError("Missing 'collateral_sub-category' in the filtered data.")
 
             valid_subsubs = sorted(sub_df["collateral_sub-category"].dropna().unique())
-            totals = {}
-            total_val = 0
+            total_val = sub_df["adjusted_collateral_value"].sum()
+
+            data = []
             for sub in valid_subsubs:
-                total = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
-                totals[sub.lower().replace(" ", "_")] = total
-                total_val += total
+                subtotal = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
+                data.append({
+                    "collateral_type": sub.lower().replace(" ", "_"),
+                    "total": round(subtotal),
+                    "percentage": round((subtotal / total_val) * 100) if total_val else 0
+                })
 
-            result = {
-                sub: round((val / total_val) * 100) if total_val else 0
-                for sub, val in totals.items()
+            return {
+                "collateral_parent_type": sub_category_level,
+                "data": data
             }
-            result["title"] = f"Collateral Distribution by Sub-Category ({sub_category_level})"
-            return result
 
-
+        # ✅ No sub-category: breakdown by collateral_category
         valid_categories = sorted(df["collateral_category"].dropna().unique())
-        totals = {}
-        total_val = 0
+        total_val = df["adjusted_collateral_value"].sum()
+
+        data = []
         for cat in valid_categories:
-            total = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
-            totals[cat.lower().replace(" ", "_")] = total
-            total_val += total
-        result = {
-            cat: round((value / total_val) * 100) if total_val else 0
-            for cat, value in totals.items()
+            subtotal = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
+            data.append({
+                "collateral_type": cat.capitalize(),
+                "total": round(subtotal),
+                "percentage": round((subtotal / total_val) * 100) if total_val else 0
+            })
+
+        return {
+            "collateral_parent_type": category_level,
+            "data": data
         }
-        result["title"] = f"Collateral Distribution by Category ({category_level})"
-        return result
 
     
     def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
@@ -6165,91 +6155,125 @@ def coverage_ratio_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
-#SuccessResponse Model
+class CollateralDistributionData(BaseModel):
+    collateral_type: str
+    total: int
+    percentage: int
+
 class CollateralDistributionResponse(BaseModel):
-    title: str
-    distribution: Dict[str, int]
-#ErrorResponse Model
+    collateral_parent_type: str  # changed from collateral_type
+    data: List[CollateralDistributionData]  # changed from distribution
+    
+# ✅ ErrorResponse Model (unchanged)
 class ErrorResponse(BaseModel):
     error: str
-    
+
+# ✅ Updated route with correct response model
 @app.get(
     "/collateral_distribution",
     response_model=CollateralDistributionResponse,
-    responses={
-        200: {
-            "description": "Returns collateral distribution by category and sub-category.",
-            "content": {
-                "application/json": {
-                    "examples": {
-                        "By Category": {
-                            "summary": "Distribution by category only",
-                            "value": {
-                                "title": "Collateral Distribution by Category (Collateral Land & Building)",
-                                "distribution": {
-                                    "building": 55,
-                                    "land": 45
+    responses = {
+    200: {
+        "description": "Returns collateral distribution by category and sub-category.",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "By Category": {
+                        "summary": "Distribution by category only",
+                        "value": {
+                            "collateral_parent_type": "Collateral Land & Building",
+                            "data": [
+                                {
+                                    "collateral_type": "Building",
+                                    "total": 18397961064,
+                                    "percentage": 50
+                                },
+                                {
+                                    "collateral_type": "Land",
+                                    "total": 18279990342,
+                                    "percentage": 50
                                 }
-                            }
-                        },
-                        "By Sub-Category": {
-                            "summary": "Distribution by sub-category within a category",
-                            "value": {
-                                "title": "Collateral Distribution by Sub-Category (Building)",
-                                "distribution": {
-                                    "warehouse": 40,
-                                    "office": 30,
-                                    "factory": 30
+                            ]
+                        }
+                    },
+                    "By Sub-Category": {
+                        "summary": "Distribution by sub-category within a category",
+                        "value": {
+                            "collateral_parent_type": "Land",
+                            "data": [
+                                {
+                                    "collateral_type": "empty_land",
+                                    "total": 2236790052,
+                                    "percentage": 35
+                                },
+                                {
+                                    "collateral_type": "farm_land",
+                                    "total": 2903966370,
+                                    "percentage": 45
+                                },
+                                {
+                                    "collateral_type": "other_functioning_land",
+                                    "total": 1311081831,
+                                    "percentage": 20
                                 }
-                            }
+                            ]
                         }
                     }
                 }
             }
-        },
-        400: {
-            "model": ErrorResponse,
-            "description": "Unexpected internal error.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
-                    }
-                }
-            }
-        },
-        404: {
-            "model": ErrorResponse,
-            "description": "Collateral data not found.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "Collateral data is not available."
-                    }
-                }
-            }
-        },
-        422: {
-            "description": "Validation error — invalid date or parameters.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": [
-                            {
-                                "loc": ["query", "category_level"],
-                                "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
-                                "type": "value_error"
-                            },
-                            {
-                                "loc": ["query", "date"],
-                                "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
-                                "type": "value_error"
-                            }
-                        ]
-                    }
+        }
+    },
+    400: {
+        "model": ErrorResponse,
+        "description": "Unexpected internal error.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 400,
+                    "message": "Bad Request",
+                    "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
                 }
             }
         }
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "Collateral data not found.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 404,
+                    "message": "Collateral data is not available.",
+                    "details": None
+                }
+            }
+        }
+    },
+    422: {
+        "model": ErrorResponse,
+        "description": "Validation error — invalid date or parameters.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 422,
+                    "message": "Validation Error",
+                    "details": [
+                        {
+                            "loc": ["query", "category_level"],
+                            "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
+                            "type": "value_error"
+                        },
+                        {
+                            "loc": ["query", "date"],
+                            "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
+                            "type": "value_error"
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
     },
     summary="Get Collateral Distribution",
     description="Returns the distribution of collateral by category and optionally by sub-category for a given date. Supports haircut adjustments."
@@ -6268,10 +6292,7 @@ def collateral_distribution(
             apply_haircut=haircut
         )
 
-        return CollateralDistributionResponse(
-            title=result.pop("title"),
-            distribution=result
-        )
+        return result  # Directly return the data as is
 
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=[{
