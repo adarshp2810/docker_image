@@ -181,12 +181,35 @@ class RiskDataModel:
         self.rl_df = rl_df
         self.df_rating = rating_df
         self.df_collateral = collateral_df
+        self.data_folder = DATA_FOLDER  # wherever you pass it from main
+
 
         if self.df_customer is not None and "cust_name" in self.df_customer.columns:
             self.df_customer = self.df_customer.drop(columns=["cust_name"])
 
         self._join_data()
         self._join_collateral()
+        self.valid_collateral_types = []
+        self.valid_categories = []
+        self.valid_subcategories = []
+        self._set_valid_values()
+        
+    def _set_valid_values(self):
+        if self.df_collateral_joined is not None:
+            cols = self.df_collateral_joined.columns
+            self.valid_collateral_types = (
+                sorted(self.df_collateral_joined["collateral_type"].dropna().unique())
+                if "collateral_type" in cols else []
+            )
+            self.valid_categories = (
+                sorted(self.df_collateral_joined["collateral_category"].dropna().unique())
+                if "collateral_category" in cols else []
+            )
+            self.valid_subcategories = (
+                sorted(self.df_collateral_joined["collateral_sub-category"].dropna().unique())
+                if "collateral_sub-category" in cols else []
+            )
+
 
     def _join_data(self):
         if self.df_fact_risk is None or self.df_customer is None:
@@ -367,7 +390,7 @@ class RiskDataModel:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
-        fields = {"group", "group_id", "cust_id","rating","internal_rating"}
+        fields = {"group", "group_id", "cust_id"}
         # Validate fact_fields
         if fact_fields:
             for field in fact_fields:
@@ -383,7 +406,7 @@ class RiskDataModel:
                 if group_field not in df.columns:
                     raise ValueError(f"Group by field '{group_field}'is not found.")
                 
-                if pd.api.types.is_numeric_dtype(df[group_field]) and group_field not in fields:
+                if pd.api.types.is_numeric_dtype(df[group_field]) and group_field not in fields and group_field != "rating":
                     raise ValueError(f"Numeric field '{group_field}' is not allowed as a group by field.")
 
         # date filter
@@ -636,11 +659,12 @@ class RiskDataModel:
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         if date_filter:
             try:
-                date_obj = pd.to_datetime(date_filter, dayfirst=True)
-                df = df[df["date"] == date_obj]
+                selected_date = pd.to_datetime(date_filter, dayfirst=True)
             except Exception:
                 raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
-            
+        else:
+            selected_date = df["date"].max() 
+              
         if period_type not in ("M", "Q"):
             raise ValueError(f"Unexpected value;Only 'M' (monthly) or 'Q' (quarterly) are allowed.")
 
@@ -1675,13 +1699,13 @@ class RiskDataModel:
         return result
     
     def get_aggregated_metrics_by_field(
-        self,
-        metrics: str,
-        group_by_field: Optional[str] = None,
-        date_filter: Optional[str] = None,
-        dimension_filter_field: Optional[str] = None,
-        dimension_filter_value: Optional[str] = None,
-        additional_field: Optional[str] = None):
+    self,
+    metrics: str,
+    group_by_field: Optional[str] = None,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None,
+    additional_field: Optional[str] = None):
 
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
@@ -2010,7 +2034,7 @@ class RiskDataModel:
             "top_customers": grouped.sort_values("total_collateral", ascending=False).head(top_n).to_dict(orient="records")
         }
                
-   def trend_by_period(
+    def trend_by_period(
         self,
         end_date: str,
         period_type: str,
@@ -2382,7 +2406,201 @@ class RiskDataModel:
             if dimension_filter_field and dimension_filter_value:
                 result = {dimension_filter_field: dimension_filter_value, **result}
 
+            return result 
+        
+    def get_collateral_distribution(
+        self,
+        category_level: str,
+        sub_category_level: Optional[str],
+        date_filter: str,
+        apply_haircut: bool
+    ) -> Dict[str, Any]:
+        if self.df_collateral_joined is None:
+            raise FileNotFoundError("Collateral data is not available.")
+
+        if category_level not in self.valid_collateral_types:
+            raise ValueError(f"Invalid collateral type. Allowed: {self.valid_collateral_types}")
+
+        valid_subcategories_for_category = sorted(
+            self.df_collateral_joined[
+                self.df_collateral_joined["collateral_type"] == category_level
+            ]["collateral_category"].dropna().unique()
+        )
+        if sub_category_level and sub_category_level not in valid_subcategories_for_category:
+            raise ValueError(f"Invalid sub-category for {category_level}. Allowed: {valid_subcategories_for_category}")
+
+        try:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError(f"Invalid date format: '{date_filter}'. Expected 'dd/mm/yyyy'.")
+
+        df = self.df_collateral_joined.copy()
+        df = df[(df["collateral_type"] == category_level) & (df["date"] == date_obj)]
+
+        if df.empty:
+            if sub_category_level:
+                valid_subsub = sorted(
+                    self.df_collateral_joined[
+                        (self.df_collateral_joined["collateral_type"] == category_level) &
+                        (self.df_collateral_joined["collateral_category"] == sub_category_level)
+                    ]["collateral_sub-category"].dropna().unique()
+                )
+                return {
+                    **{s.lower().replace(" ", "_"): 0 for s in valid_subsub},
+                    "title": f"Collateral Distribution by Sub-Category ({sub_category_level})"
+                }
+            valid_categories = sorted(
+                self.df_collateral_joined[
+                    self.df_collateral_joined["collateral_type"] == category_level
+                ]["collateral_category"].dropna().unique()
+            )
+            return {
+                **{c.lower().replace(" ", "_"): 0 for c in valid_categories},
+                "title": f"Collateral Distribution by Category ({category_level})"
+            }
+
+        if apply_haircut:
+            df["adjusted_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
+        else:
+            df["adjusted_collateral_value"] = df["collateral_value"]
+
+        if sub_category_level:
+            sub_df = df[df["collateral_category"] == sub_category_level]
+
+            if "collateral_sub-category" not in sub_df.columns:
+                logger.error("Missing 'collateral_sub_category' in sub_df.")
+                logger.warning(f"sub_df columns: {sub_df.columns.tolist()}")
+                raise ValueError("Missing 'collateral_sub_category' in the filtered data.")
+
+            valid_subsubs = sorted(sub_df["collateral_sub-category"].dropna().unique())
+            totals = {}
+            total_val = 0
+            for sub in valid_subsubs:
+                total = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
+                totals[sub.lower().replace(" ", "_")] = total
+                total_val += total
+
+            result = {
+                sub: round((val / total_val) * 100) if total_val else 0
+                for sub, val in totals.items()
+            }
+            result["title"] = f"Collateral Distribution by Sub-Category ({sub_category_level})"
             return result
+
+
+        valid_categories = sorted(df["collateral_category"].dropna().unique())
+        totals = {}
+        total_val = 0
+        for cat in valid_categories:
+            total = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
+            totals[cat.lower().replace(" ", "_")] = total
+            total_val += total
+        result = {
+            cat: round((value / total_val) * 100) if total_val else 0
+            for cat, value in totals.items()
+        }
+        result["title"] = f"Collateral Distribution by Category ({category_level})"
+        return result
+
+    
+    def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
+        import os
+
+        if self.df_collateral is None or self.df_fact_risk is None:
+            raise FileNotFoundError("Missing collateral or fact_risk data.")
+
+        # Step 1: Load customer data locally from Excel to get cust_name
+        customer_data = []
+        for filename in os.listdir(self.data_folder):
+            if filename.endswith(".xlsx") and not filename.startswith("~$"):
+                path = os.path.join(self.data_folder, filename)
+                try:
+                    xls = pd.ExcelFile(path)
+                    if "CUSTOMER" in xls.sheet_names:
+                        df_cust = xls.parse("CUSTOMER")
+                        df_cust.columns = [str(c).strip().lower().replace(" ", "_") for c in df_cust.columns]
+                        customer_data.append(df_cust)
+                except Exception as e:
+                    logger.warning(f"Failed to read {filename}: {e}")
+                    continue
+
+        if not customer_data:
+            raise FileNotFoundError("No valid CUSTOMER sheet found to extract cust_name.")
+
+        df_customer = pd.concat(customer_data, ignore_index=True).drop_duplicates(subset=["cust_id"])
+
+        # Step 2: Prepare working copies
+        df_coll = self.df_collateral.copy()
+        df_fact = self.df_fact_risk.copy()
+
+        # Step 3: Clean and join
+        df_coll["date"] = pd.to_datetime(df_coll["date"], errors="coerce", dayfirst=True)
+        df_fact.columns = [str(c).strip().lower().replace(" ", "_") for c in df_fact.columns]
+        df_fact["date"] = pd.to_datetime(df_fact["date"], errors="coerce", dayfirst=True)
+
+        df = pd.merge(df_coll, df_customer, how="left", left_on="customer_id", right_on="cust_id")
+        df = pd.merge(df, df_fact[["cust_id", "exposure", "date"]], how="left", on=["cust_id", "date"])
+
+        try:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError("Invalid date format. Use DD/MM/YYYY.")
+
+        df = df[(df["collateral_type"] == collateral_type) & (df["date"] == date_obj)].copy()
+
+        if df.empty:
+            return []
+
+        # ✅ Haircut processing fixed here
+        # Convert to float and scale if hair_cut looks like percentage (e.g., 75 becomes 0.75)
+        df["hair_cut"] = df["hair_cut"].astype(str).str.replace('%', '', regex=False).str.strip()
+        df["hair_cut"] = pd.to_numeric(df["hair_cut"], errors="coerce") / 100.0
+        df["hair_cut"] = df["hair_cut"].clip(lower=0, upper=1).fillna(0)
+
+        df["collateral_value"] = pd.to_numeric(df["collateral_value"], errors="coerce").fillna(0)
+        df["hc_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
+        df["customer_hc_collateral"] = df["hc_collateral_value"]
+
+        if "cust_name" not in df.columns:
+            raise ValueError("cust_name still not found after merge.")
+
+        grouped = df.groupby("collateral_name").agg({
+            "date": "first",
+            "collateral_type": "first",
+            "collateral_grade": "mean",
+            "collateral_value": "sum",
+            "hc_collateral_value": "sum"
+        }).reset_index()
+
+        customer_info = df.groupby("collateral_name").apply(
+            lambda x: x[["cust_name", "exposure", "customer_hc_collateral"]].to_dict(orient="records")
+        ).reset_index(name="customers")
+
+        result_df = pd.merge(grouped, customer_info, on="collateral_name", how="left")
+
+        result = []
+        for _, row in result_df.iterrows():
+            entry = {
+                "Date": row["date"].strftime('%d/%m/%Y'),
+                "Collateral Name": row["collateral_name"],
+                "Type": row["collateral_type"],
+                "Grade": round(row["collateral_grade"], 2) if pd.notna(row["collateral_grade"]) else None,
+                "Collateral Value": row["collateral_value"],
+                "HC Collateral Value": row["hc_collateral_value"],
+                "Customers": [
+                    {
+                        "Customer Name": cust["cust_name"],
+                        "Customer Exposure": cust["exposure"],
+                        "Customer HC Collateral": cust["customer_hc_collateral"]
+                    }
+                    for cust in row["customers"]
+                ]
+            }
+            result.append(entry)
+
+        result.sort(key=lambda x: x["Collateral Value"] if x["Collateral Value"] is not None else float('-inf'), reverse=True)
+        return result[:top_n] if top_n is not None else result
+
 
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
     if fact_df is None or customer_df is None:
@@ -3064,7 +3282,7 @@ def get_sum_by_dimension(
 class GroupedAvgRecord(RootModel[List[Dict[str, Union[str, int, float]]]]):
     class Config:
         json_schema_extra = {
-            "examples": [{  "sector": "Chemicals", "exposure": 101573364,"provision": 201811},
+            "examples": [{"sector": "Chemicals", "exposure": 101573364,"provision": 201811},
                          {"sector": "Consumer Staples","exposure": 105583832,"provision": 10359582},
                          {"sector": "Financials","exposure": 108139973,"provision": 41866895},
                          {"sector": "Industrials","exposure": 175477898,"provision": 79002909},
@@ -3103,7 +3321,7 @@ class ErrorResponse(BaseModel):
                         "Grouped Average": {
                             "summary": "Grouped by sector",
                             "value": [
-                                {  "sector": "Chemicals", "exposure": 101573364,"provision": 201811},
+                                {"sector": "Chemicals", "exposure": 101573364,"provision": 201811},
                                 {"sector": "Consumer Staples","exposure": 105583832,"provision": 10359582},
                                 {"sector": "Financials","exposure": 108139973,"provision": 41866895},
                                 {"sector": "Industrials","exposure": 175477898,"provision": 79002909},
@@ -3226,6 +3444,7 @@ def get_avg_by_dimension(
         group_by_fields_list = []
         if group_by_fields:
             group_by_fields_list = [g.strip() for g in group_by_fields.split(',')]
+            validate_field_names(group_by_fields_list, "group_by_fields")
 
         if dimension_filter_field:
             validate_field_names([dimension_filter_field], "dimension_filter_field")
@@ -4809,7 +5028,7 @@ def weighted_average_trend(
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
 # --- Success Response Model ---
-class AggregatedMetricsResponse( RootModel[Union[Dict[str, float], List[Dict[str, float]]]]):
+class AggregatedMetricsResponse( RootModel[List[Dict[str, Union[str, float, int]]]]):
     class Config:
         json_schema_extra = {
             "example": [{"rating": 1,"exposure": 549773740,"pd": 0},{"rating": 2,"exposure": 1369028386,"pd": 0.02},
@@ -4923,14 +5142,14 @@ def aggregated_metrics_by_field(
     try:
         validate_metrics(metrics)
         for f in metrics.split(","):
-            validate_field_names(f.split(":")[0], "metrics")
+            validate_field_names([f.split(":")[0]], "metrics")
 
         if group_by_field:
-            validate_field_names(group_by_field, "group_by_field")
+            validate_field_names([group_by_field], "group_by_field")
         if dimension_filter_field:
-            validate_field_names(dimension_filter_field, "dimension_filter_field")
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
         if additional_field:
-            validate_field_names(additional_field, "additional_field")
+            validate_field_names([additional_field], "additional_field")
             
         result = risk_model.get_aggregated_metrics_by_field(
             metrics=metrics,
@@ -5945,6 +6164,287 @@ def coverage_ratio_endpoint(
         raise HTTPException(status_code=404, detail=str(fnf))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+
+#SuccessResponse Model
+class CollateralDistributionResponse(BaseModel):
+    title: str
+    distribution: Dict[str, int]
+#ErrorResponse Model
+class ErrorResponse(BaseModel):
+    error: str
+    
+@app.get(
+    "/collateral_distribution",
+    response_model=CollateralDistributionResponse,
+    responses={
+        200: {
+            "description": "Returns collateral distribution by category and sub-category.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "By Category": {
+                            "summary": "Distribution by category only",
+                            "value": {
+                                "title": "Collateral Distribution by Category (Collateral Land & Building)",
+                                "distribution": {
+                                    "building": 55,
+                                    "land": 45
+                                }
+                            }
+                        },
+                        "By Sub-Category": {
+                            "summary": "Distribution by sub-category within a category",
+                            "value": {
+                                "title": "Collateral Distribution by Sub-Category (Building)",
+                                "distribution": {
+                                    "warehouse": 40,
+                                    "office": 30,
+                                    "factory": 30
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Collateral data not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Collateral data is not available."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error — invalid date or parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "category_level"],
+                                "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
+                                "type": "value_error"
+                            },
+                            {
+                                "loc": ["query", "date"],
+                                "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
+                                "type": "value_error"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Collateral Distribution",
+    description="Returns the distribution of collateral by category and optionally by sub-category for a given date. Supports haircut adjustments."
+)
+def collateral_distribution(
+    category_level: str = Query(..., description="Collateral type, e.g., 'Collatral Land & Building'"),
+    sub_category_level: Optional[str] = Query(None, description="Optional sub-category like 'Building', 'Land', 'Shares'"),
+    date: str = Query(..., description="Date in DD/MM/YYYY format"),
+    haircut: bool = Query(False, description="Whether to apply haircut adjustment")
+):
+    try:
+        result = risk_model.get_collateral_distribution(
+            category_level=category_level,
+            sub_category_level=sub_category_level,
+            date_filter=date,
+            apply_haircut=haircut
+        )
+
+        return CollateralDistributionResponse(
+            title=result.pop("title"),
+            distribution=result
+        )
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=[{
+            "loc": ["query"],
+            "msg": str(ve),
+            "type": "value_error"
+        }])
+
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail={"error": str(fnf)})
+
+    except Exception as e:
+        logger.exception("Unexpected error in /collateral_distribution")
+        raise HTTPException(status_code=400, detail={"error": f"An unexpected error occurred: {str(e)}"})
+
+#SuccessResponse Model
+class CollateralCustomerItem(BaseModel):
+    Customer_Name: str
+    Customer_Exposure: Optional[float]
+    Customer_HC_Collateral: Optional[float]
+
+class TopCollateralItem(BaseModel):
+    Date: str
+    Collateral_Name: str
+    Type: str
+    Grade: Optional[float]
+    Collateral_Value: Optional[float]
+    HC_Collateral_Value: Optional[float]
+    Customers: List[CollateralCustomerItem]
+
+from pydantic import RootModel
+
+class TopCollateralResponse(RootModel[List[TopCollateralItem]]):
+    pass
+
+#ErrorResponse Model 
+class ErrorResponse(BaseModel):
+    code: int
+    message: str
+    details: Optional[str] = None
+    
+@app.get(
+    "/api/top_collaterals",
+    
+    summary="Get Top Collateral Items",
+    description="Returns the top collateral items for a given type and date, with an optional limit on the result size.",
+    responses={
+        200: {
+            "description": "A list of top collateral items",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "date": "31/12/2022",
+                            "collateral_name": "Building1",
+                            "type": "Collateral Land & Building",
+                            "grade": 4.0,
+                            "collateral_value": 6427101.5,
+                            "hc_collateral_value": 3213550.75,
+                            "customers": [
+                                {
+                                    "customer_name": "SABIC",
+                                    "customer_exposure": 101537501.0,
+                                    "customer_hc_collateral": 3213550.75
+                                }
+                            ]
+                        },
+                        {
+                            "date": "31/12/2022",
+                            "collateral_name": "SharesXYZ",
+                            "type": "Shares",
+                            "grade": 3.5,
+                            "collateral_value": 5000000.0,
+                            "hc_collateral_value": 2500000.0,
+                            "customers": [
+                                {
+                                    "customer_name": "CorpA",
+                                    "customer_exposure": 75000000.0,
+                                    "customer_hc_collateral": 2500000.0
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No data found for the specified type and date",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 404,
+                        "message": "No data found for specified type and date.",
+                        "details": None
+                    }
+                }
+            }
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "Validation error due to invalid input",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 422,
+                        "message": "Invalid date format: '31-04-2024'. Please use 'DD/MM/YYYY'.",
+                        "details": None
+                    }
+                }
+            }
+        },
+        500: {
+            "model": ErrorResponse,
+            "description": "Internal server error",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 500,
+                        "message": "Internal server error",
+                        "details": "Unexpected error occurred while processing the request."
+                    }
+                }
+            }
+        }
+    }
+)
+def get_top_collaterals(
+    type: str = Query(..., description="Collateral type (e.g., 'Collatral Land & Building', 'Collateral Shares & Other Paper Assests')"),
+    date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2022')"),
+    top_n: Optional[int] = Query(None, description="Maximum number of top items to return")
+):
+    """
+    Retrieve the top collateral items based on type, date, and an optional limit.
+    """
+    try:
+        # Call the risk_model method to get the top collaterals
+        result = risk_model.get_top_collaterals(
+            collateral_type=type,
+            date_filter=date_filter,
+            top_n=top_n
+        )
+
+        # Check if the result is empty
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=ErrorResponse(
+                    code=404,
+                    message="No data found for specified type and date."
+                ).dict()
+            )
+
+        # Return the result; FastAPI will validate and serialize it to List[CollateralItem]
+        return result
+
+    except ValueError as ve:
+        # Handle validation errors (e.g., invalid type or date format)
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorResponse(code=422, message=str(ve)).dict()
+        )
+    except Exception as e:
+        # Log unexpected errors and return a 500 response
+        logger.error(f"Unexpected error in /api/top_collaterals: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse(
+                code=500,
+                message="Internal server error",
+                details=str(e)
+            ).dict()
+        )
 
 if __name__ == "__main__":
     import uvicorn
