@@ -2010,7 +2010,7 @@ class RiskDataModel:
             "top_customers": grouped.sort_values("total_collateral", ascending=False).head(top_n).to_dict(orient="records")
         }
                
-    def trend_by_period(
+   def trend_by_period(
         self,
         end_date: str,
         period_type: str,
@@ -2031,8 +2031,7 @@ class RiskDataModel:
         # Parse comma-separated fields
         fields = [f.strip() for f in fact_fields_str.split(",") if f.strip()]
         if "exposure" not in fields or len(fields) < 2:
-            raise HTTPException(400, "fact_fields must include 'exposure' and one other field")
-        other = [f for f in fields if f != "exposure"][0]
+            raise HTTPException(400, "fact_fields must include 'exposure' and at least one other field")
 
         for f in fields:
             if f not in df.columns:
@@ -2059,9 +2058,9 @@ class RiskDataModel:
         if df.empty:
             return {"error": "No data after applying filters."}
 
-        # Aggregate
+        # Aggregate selected fields
         grp = (
-            df.groupby("period_date")[["exposure", other]]
+            df.groupby("period_date")[fields]
             .sum()
             .reset_index()
             .sort_values("period_date", ascending=False)
@@ -2069,11 +2068,19 @@ class RiskDataModel:
             .sort_values("period_date")
         )
 
-        # Label: always as "Mon YYYY" format
+        # Format date label
         grp["date"] = grp["period_date"].dt.strftime("%b %Y")
-        grp["coverage_ratio"] = grp[other] / grp["exposure"] * 100
-        grp = grp[["date", "exposure", other, "coverage_ratio"]].round(2)
 
+        # Calculate coverage ratio for each non-exposure field
+        for f in fields:
+            if f != "exposure":
+                grp[f"coverage_ratio_{f}"] = grp[f] / grp["exposure"] * 100
+
+        # Build final output columns
+        output_fields = ["date"] + fields + [f"coverage_ratio_{f}" for f in fields if f != "exposure"]
+        grp = grp[output_fields].round(2)
+
+        # Convert numpy types to native Python types
         for col in grp.columns:
             grp[col] = grp[col].apply(lambda x: x.item() if hasattr(x, "item") else x)
 
