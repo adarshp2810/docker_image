@@ -5545,7 +5545,7 @@ class ErrorResponse(BaseModel):
 def get_coverage_trend(
     date: str = Query(..., description="End date (DD/MM/YYYY)"),
     period_type: str = Query(..., description="M = Monthly, Q = Quarterly"),
-    fact_fields: str = Query(..., description="Comma-separated fields (must include 'exposure' and either 'provision' or 'total_hc_collateral')"),
+    fact_fields: str = Query(..., description="Comma-separated fields (must include 'exposure' and fields like 'provision' or 'total_hc_collateral')"),
     filter_field: Optional[str] = Query(None),
     filter_value: Optional[str] = Query(None)
 ):
