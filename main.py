@@ -2329,20 +2329,21 @@ class RiskDataModel:
         return result
     
     def get_coverage_ratio(
-    self,
-    numerator_field: str = "total_hc_collateral",
-    denominator_field: str = "exposure",
-    group_by_field: Optional[str] = None,
-    date_filter: Optional[str] = None,
-    dimension_filter_field: Optional[str] = None,
-    dimension_filter_value: Optional[str] = None
-    ):
+        self,
+        numerator_field: str,
+        denominator_field: str = "exposure",
+        date_filter: Optional[str] = None,
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None,
+        group_by_field: Optional[str] = None
+    ) -> Dict[str, Any]:
+
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
 
-        # Validate fields
+        # ✅ Validate required columns
         for field in [numerator_field, denominator_field]:
             if field not in df.columns:
                 raise ValueError(f"Field '{field}' is not found in the dataset.")
@@ -2350,28 +2351,24 @@ class RiskDataModel:
         if group_by_field and group_by_field not in df.columns:
             raise ValueError(f"Group by field '{group_by_field}' is not found in the dataset.")
 
-        if dimension_filter_field:
-            if dimension_filter_field not in df.columns:
-                raise ValueError(f"Dimension filter field '{dimension_filter_field}' is not found in the dataset.")
-            if dimension_filter_value is None:
-                raise ValueError("Dimension filter value is missing for the given dimension filter field.")
-
-        # Apply date filter
+        # ✅ Apply date filter
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         if date_filter:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
             df = df[df["date"] == date_obj]
 
-        # Apply dimension filter
-        if dimension_filter_field and dimension_filter_value:
-            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]):
-                df = df[df[dimension_filter_field] == pd.to_numeric(dimension_filter_value, errors='coerce')]
-            else:
-                df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+        # ✅ Apply dimension filter
+        if dimension_filter_field:
+            if dimension_filter_field not in df.columns:
+                raise ValueError(f"Filter field '{dimension_filter_field}' is not found.")
+            if dimension_filter_value is None:
+                raise ValueError("Missing value for dimension filter.")
+            df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
 
-            if df.empty:
-                raise FileNotFoundError("No data available after applying filters.")
+        if df.empty:
+            raise FileNotFoundError("No data available after applying filters.")
 
+        # ✅ Grouping
         if group_by_field:
             grouped = df.groupby(group_by_field).agg(
                 numerator_sum=(numerator_field, 'sum'),
@@ -2380,33 +2377,30 @@ class RiskDataModel:
 
             grouped["coverage_ratio"] = grouped.apply(
                 lambda row: round((row["numerator_sum"] / row["denominator_sum"]) * 100, 2)
-                if row["denominator_sum"] != 0 else None, axis=1
+                if row["denominator_sum"] else None,
+                axis=1
             )
 
             result = grouped[[group_by_field, "coverage_ratio"]].to_dict(orient="records")
-
-            if not result:
-                raise FileNotFoundError("No data available after applying filters and calculations.")
-
-            if dimension_filter_field and dimension_filter_value:
-                result.insert(0, {dimension_filter_field: dimension_filter_value})
-
+            if dimension_filter_field:
+                for row in result:
+                    row[dimension_filter_field] = dimension_filter_value
             return result
 
-        else:
-            numerator_sum = df[numerator_field].sum()
-            denominator_sum = df[denominator_field].sum()
+        # ✅ No group: just return single ratio
+        numerator_total = df[numerator_field].sum()
+        denominator_total = df[denominator_field].sum()
 
-            if denominator_sum == 0:
-                raise FileNotFoundError("No valid denominator found to compute coverage ratio.")
+        if denominator_total == 0:
+            raise ZeroDivisionError("Denominator sum is zero — cannot compute coverage ratio.")
 
-            coverage_ratio = round((numerator_sum / denominator_sum) * 100, 2)
-
-            result = {"coverage_ratio": coverage_ratio}
-            if dimension_filter_field and dimension_filter_value:
-                result = {dimension_filter_field: dimension_filter_value, **result}
-
-            return result 
+        return {
+            "numerator": numerator_field,
+            "denominator": denominator_field,
+            "coverage_ratio": round((numerator_total / denominator_total) * 100, 2),
+            "dimension": dimension_filter_value if dimension_filter_field else None
+        }
+ 
         
     def get_collateral_distribution(
         self,
@@ -6035,6 +6029,11 @@ class CoverageRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
             }
         }
 
+class CoverageRatioSingleResult(BaseModel):
+    numerator: str
+    denominator: str
+    coverage_ratio: float
+    
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
 
@@ -6137,15 +6136,17 @@ class ErrorResponse(BaseModel):
     description="Computes sum(total_hc_collateral) / sum(exposure) with optional filters and groupings."
 )
 def coverage_ratio_endpoint(
+    numerator_field: str = Query(..., description="Numerator field (e.g., 'hc_collateral_building')"),
+    denominator_field: str = Query("exposure", description="Denominator field (default is 'exposure')"),
     group_by_field: Optional[str] = Query(None, description="Optional group by field (e.g., 'sector')"),
     date_filter: Optional[str] = Query(None, description="Optional date filter (dd/mm/yyyy)"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'sector')"),
-    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'Financials')")
+    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'region')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'South')")
 ):
     try:
         result = risk_model.get_coverage_ratio(
-            numerator_field="total_hc_collateral",
-            denominator_field="exposure",
+            numerator_field=numerator_field,
+            denominator_field=denominator_field,
             group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
