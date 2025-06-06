@@ -14,6 +14,7 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field, RootModel
 from dateutil.relativedelta import relativedelta
 from natsort import natsorted
+from urllib.parse import unquote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2402,6 +2403,8 @@ class RiskDataModel:
         }
  
         
+    from urllib.parse import unquote
+
     def get_collateral_distribution(
         self,
         category_level: str,
@@ -2409,91 +2412,121 @@ class RiskDataModel:
         date_filter: str,
         apply_haircut: bool
     ) -> Dict[str, Any]:
+
         if self.df_collateral_joined is None:
             raise FileNotFoundError("Collateral data is not available.")
 
-        if category_level not in self.valid_collateral_types:
-            raise ValueError(f"Invalid collateral type. Allowed: {self.valid_collateral_types}")
+        # Local utilities (won't affect other APIs)
+        def slugify(name: str) -> str:
+            return name.strip().lower().replace(" ", "_").replace("&", "and")
 
-        valid_subcategories_for_category = sorted(
-            self.df_collateral_joined[
-                self.df_collateral_joined["collateral_type"] == category_level
-            ]["collateral_category"].dropna().unique()
-        )
-        if sub_category_level and sub_category_level not in valid_subcategories_for_category:
-            raise ValueError(f"Invalid sub-category for {category_level}. Allowed: {valid_subcategories_for_category}")
+        def deslugify(slug: str) -> str:
+            return unquote(slug).replace("and", "&").replace("_", " ").title().strip()
 
+        def resolve_slug(slug: str, valid_options: List[str]) -> Optional[str]:
+            normalized_map = {slugify(option): option for option in valid_options}
+            return normalized_map.get(slugify(unquote(slug)))
+
+        # Resolve slugs
+        category_level_actual = resolve_slug(category_level, self.valid_collateral_types)
+        if not category_level_actual:
+            raise ValueError(f"Invalid category_level: '{category_level}'")
+
+        sub_level_actual = None
+        if sub_category_level:
+            all_subcats = self.df_collateral_joined["collateral_category"].dropna().unique()
+            sub_level_actual = resolve_slug(sub_category_level, all_subcats)
+            if not sub_level_actual:
+                raise ValueError(f"Invalid sub_category_level: '{sub_category_level}'")
+
+        # Parse date
         try:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
         except Exception:
-            raise ValueError(f"Invalid date format: '{date_filter}'. Expected 'dd/mm/yyyy'.")
+            raise ValueError(f"Invalid date format: '{date_filter}' (Expected dd/mm/yyyy)")
 
         df = self.df_collateral_joined.copy()
-        df = df[(df["collateral_type"] == category_level) & (df["date"] == date_obj)]
+        df = df[(df["collateral_type"] == category_level_actual) & (df["date"] == date_obj)]
 
-        # ✅ Convert hair_cut from "50%" → 0.5
+        # Haircut
         df["hair_cut"] = (
             pd.to_numeric(df["hair_cut"].astype(str).str.replace('%', ''), errors="coerce")
             .fillna(0) / 100
         )
 
-        if apply_haircut:
-            df["adjusted_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
-        else:
-            df["adjusted_collateral_value"] = df["collateral_value"]
+        df["adjusted_collateral_value"] = (
+            df["collateral_value"] * (1 - df["hair_cut"])
+            if apply_haircut else df["collateral_value"]
+        )
 
         if df.empty:
             return {
-                "collateral_parent_type": sub_category_level or category_level,
+                "collateral_parent_type": sub_level_actual or category_level_actual,
                 "data": []
             }
 
-        if sub_category_level:
-            sub_df = df[df["collateral_category"] == sub_category_level]
-
+        # Sub-category view
+        if sub_level_actual:
+            sub_df = df[df["collateral_category"] == sub_level_actual]
             if "collateral_sub-category" not in sub_df.columns:
-                logger.error("Missing 'collateral_sub-category' in sub_df.")
-                raise ValueError("Missing 'collateral_sub-category' in the filtered data.")
+                raise ValueError("Missing 'collateral_sub-category' in filtered data.")
 
-            valid_subsubs = sorted(sub_df["collateral_sub-category"].dropna().unique())
-            total_val = sub_df["adjusted_collateral_value"].sum()
+            total = sub_df["adjusted_collateral_value"].sum()
+            grouped = sub_df.groupby("collateral_sub-category")["adjusted_collateral_value"].sum().reset_index()
 
-            data = []
-            for sub in valid_subsubs:
-                subtotal = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
-                data.append({
-                    "collateral_type": sub.lower().replace(" ", "_"),
-                    "total": round(subtotal),
-                    "percentage": round((subtotal / total_val) * 100) if total_val else 0
-                })
+            data = [
+                {
+                    "collateral_type": slugify(row["collateral_sub-category"]),
+                    "total": round(row["adjusted_collateral_value"]),
+                    "percentage": round((row["adjusted_collateral_value"] / total) * 100) if total else 0
+                }
+                for _, row in grouped.iterrows()
+            ]
 
             return {
                 "collateral_parent_type": sub_category_level,
                 "data": data
             }
 
-        valid_categories = sorted(df["collateral_category"].dropna().unique())
-        total_val = df["adjusted_collateral_value"].sum()
+        # Category view
+        total = df["adjusted_collateral_value"].sum()
+        grouped = df.groupby("collateral_category")["adjusted_collateral_value"].sum().reset_index()
 
-        data = []
-        for cat in valid_categories:
-            subtotal = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
-            data.append({
-                "collateral_type": cat.capitalize(),
-                "total": round(subtotal),
-                "percentage": round((subtotal / total_val) * 100) if total_val else 0
-            })
+        data = [
+            {
+                "collateral_type": slugify(row["collateral_category"]),
+                "total": round(row["adjusted_collateral_value"]),
+                "percentage": round((row["adjusted_collateral_value"] / total) * 100) if total else 0
+            }
+            for _, row in grouped.iterrows()
+        ]
 
         return {
             "collateral_parent_type": category_level,
             "data": data
         }
 
-
-
     
     def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
         import os
+        from urllib.parse import unquote
+
+        # Define slugify and resolve_slug inside this method
+        def slugify(name: str) -> str:
+            return name.strip().lower().replace(" ", "_").replace("&", "and")
+
+        def resolve_slug(slug: str, valid_options: list) -> str | None:
+            normalized_map = {slugify(option): option for option in valid_options}
+            return normalized_map.get(slugify(unquote(slug)))
+
+        # Validate collateral_type against your valid types (assuming you have this list in self.valid_collateral_types)
+        collateral_type_actual = resolve_slug(collateral_type, self.valid_collateral_types)
+        if not collateral_type_actual:
+            raise ValueError(f"Invalid collateral_type: '{collateral_type}'")
+
+        collateral_type = collateral_type_actual
+
+        # ... rest of your existing code unchanged ...
 
         if self.df_collateral is None or self.df_fact_risk is None:
             raise FileNotFoundError("Missing collateral or fact_risk data.")
@@ -2540,8 +2573,7 @@ class RiskDataModel:
         if df.empty:
             return []
 
-        # ✅ Haircut processing fixed here
-        # Convert to float and scale if hair_cut looks like percentage (e.g., 75 becomes 0.75)
+        # Haircut processing
         df["hair_cut"] = df["hair_cut"].astype(str).str.replace('%', '', regex=False).str.strip()
         df["hair_cut"] = pd.to_numeric(df["hair_cut"], errors="coerce") / 100.0
         df["hair_cut"] = df["hair_cut"].clip(lower=0, upper=1).fillna(0)
