@@ -2437,19 +2437,23 @@ class RiskDataModel:
         df = self.df_collateral_joined.copy()
         df = df[(df["collateral_type"] == category_level) & (df["date"] == date_obj)]
 
+        # ✅ Convert hair_cut from "50%" → 0.5
+        df["hair_cut"] = (
+            pd.to_numeric(df["hair_cut"].astype(str).str.replace('%', ''), errors="coerce")
+            .fillna(0) / 100
+        )
+
         if apply_haircut:
             df["adjusted_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
         else:
             df["adjusted_collateral_value"] = df["collateral_value"]
 
-        # ✅ Handle empty case
         if df.empty:
             return {
                 "collateral_parent_type": sub_category_level or category_level,
                 "data": []
             }
 
-        # ✅ Sub-category provided: breakdown by collateral_sub-category
         if sub_category_level:
             sub_df = df[df["collateral_category"] == sub_category_level]
 
@@ -2474,7 +2478,6 @@ class RiskDataModel:
                 "data": data
             }
 
-        # ✅ No sub-category: breakdown by collateral_category
         valid_categories = sorted(df["collateral_category"].dropna().unique())
         total_val = df["adjusted_collateral_value"].sum()
 
@@ -2491,6 +2494,8 @@ class RiskDataModel:
             "collateral_parent_type": category_level,
             "data": data
         }
+
+
 
     
     def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
