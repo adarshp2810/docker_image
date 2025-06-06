@@ -2329,20 +2329,21 @@ class RiskDataModel:
         return result
     
     def get_coverage_ratio(
-    self,
-    numerator_field: str = "total_hc_collateral",
-    denominator_field: str = "exposure",
-    group_by_field: Optional[str] = None,
-    date_filter: Optional[str] = None,
-    dimension_filter_field: Optional[str] = None,
-    dimension_filter_value: Optional[str] = None
-    ):
+        self,
+        numerator_field: str,
+        denominator_field: str = "exposure",
+        date_filter: Optional[str] = None,
+        dimension_filter_field: Optional[str] = None,
+        dimension_filter_value: Optional[str] = None,
+        group_by_field: Optional[str] = None
+    ) -> Dict[str, Any]:
+
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
 
-        # Validate fields
+        # ✅ Validate required columns
         for field in [numerator_field, denominator_field]:
             if field not in df.columns:
                 raise ValueError(f"Field '{field}' is not found in the dataset.")
@@ -2350,28 +2351,24 @@ class RiskDataModel:
         if group_by_field and group_by_field not in df.columns:
             raise ValueError(f"Group by field '{group_by_field}' is not found in the dataset.")
 
-        if dimension_filter_field:
-            if dimension_filter_field not in df.columns:
-                raise ValueError(f"Dimension filter field '{dimension_filter_field}' is not found in the dataset.")
-            if dimension_filter_value is None:
-                raise ValueError("Dimension filter value is missing for the given dimension filter field.")
-
-        # Apply date filter
+        # ✅ Apply date filter
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         if date_filter:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
             df = df[df["date"] == date_obj]
 
-        # Apply dimension filter
-        if dimension_filter_field and dimension_filter_value:
-            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]):
-                df = df[df[dimension_filter_field] == pd.to_numeric(dimension_filter_value, errors='coerce')]
-            else:
-                df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+        # ✅ Apply dimension filter
+        if dimension_filter_field:
+            if dimension_filter_field not in df.columns:
+                raise ValueError(f"Filter field '{dimension_filter_field}' is not found.")
+            if dimension_filter_value is None:
+                raise ValueError("Missing value for dimension filter.")
+            df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
 
-            if df.empty:
-                raise FileNotFoundError("No data available after applying filters.")
+        if df.empty:
+            raise FileNotFoundError("No data available after applying filters.")
 
+        # ✅ Grouping
         if group_by_field:
             grouped = df.groupby(group_by_field).agg(
                 numerator_sum=(numerator_field, 'sum'),
@@ -2380,33 +2377,30 @@ class RiskDataModel:
 
             grouped["coverage_ratio"] = grouped.apply(
                 lambda row: round((row["numerator_sum"] / row["denominator_sum"]) * 100, 2)
-                if row["denominator_sum"] != 0 else None, axis=1
+                if row["denominator_sum"] else None,
+                axis=1
             )
 
             result = grouped[[group_by_field, "coverage_ratio"]].to_dict(orient="records")
-
-            if not result:
-                raise FileNotFoundError("No data available after applying filters and calculations.")
-
-            if dimension_filter_field and dimension_filter_value:
-                result.insert(0, {dimension_filter_field: dimension_filter_value})
-
+            if dimension_filter_field:
+                for row in result:
+                    row[dimension_filter_field] = dimension_filter_value
             return result
 
-        else:
-            numerator_sum = df[numerator_field].sum()
-            denominator_sum = df[denominator_field].sum()
+        # ✅ No group: just return single ratio
+        numerator_total = df[numerator_field].sum()
+        denominator_total = df[denominator_field].sum()
 
-            if denominator_sum == 0:
-                raise FileNotFoundError("No valid denominator found to compute coverage ratio.")
+        if denominator_total == 0:
+            raise ZeroDivisionError("Denominator sum is zero — cannot compute coverage ratio.")
 
-            coverage_ratio = round((numerator_sum / denominator_sum) * 100, 2)
-
-            result = {"coverage_ratio": coverage_ratio}
-            if dimension_filter_field and dimension_filter_value:
-                result = {dimension_filter_field: dimension_filter_value, **result}
-
-            return result 
+        return {
+            "numerator": numerator_field,
+            "denominator": denominator_field,
+            "coverage_ratio": round((numerator_total / denominator_total) * 100, 2),
+            "dimension": dimension_filter_value if dimension_filter_field else None
+        }
+ 
         
     def get_collateral_distribution(
         self,
@@ -2437,70 +2431,65 @@ class RiskDataModel:
         df = self.df_collateral_joined.copy()
         df = df[(df["collateral_type"] == category_level) & (df["date"] == date_obj)]
 
-        if df.empty:
-            if sub_category_level:
-                valid_subsub = sorted(
-                    self.df_collateral_joined[
-                        (self.df_collateral_joined["collateral_type"] == category_level) &
-                        (self.df_collateral_joined["collateral_category"] == sub_category_level)
-                    ]["collateral_sub-category"].dropna().unique()
-                )
-                return {
-                    **{s.lower().replace(" ", "_"): 0 for s in valid_subsub},
-                    "title": f"Collateral Distribution by Sub-Category ({sub_category_level})"
-                }
-            valid_categories = sorted(
-                self.df_collateral_joined[
-                    self.df_collateral_joined["collateral_type"] == category_level
-                ]["collateral_category"].dropna().unique()
-            )
-            return {
-                **{c.lower().replace(" ", "_"): 0 for c in valid_categories},
-                "title": f"Collateral Distribution by Category ({category_level})"
-            }
+        # ✅ Convert hair_cut from "50%" → 0.5
+        df["hair_cut"] = (
+            pd.to_numeric(df["hair_cut"].astype(str).str.replace('%', ''), errors="coerce")
+            .fillna(0) / 100
+        )
 
         if apply_haircut:
             df["adjusted_collateral_value"] = df["collateral_value"] * (1 - df["hair_cut"])
         else:
             df["adjusted_collateral_value"] = df["collateral_value"]
 
+        if df.empty:
+            return {
+                "collateral_parent_type": sub_category_level or category_level,
+                "data": []
+            }
+
         if sub_category_level:
             sub_df = df[df["collateral_category"] == sub_category_level]
 
             if "collateral_sub-category" not in sub_df.columns:
-                logger.error("Missing 'collateral_sub_category' in sub_df.")
-                logger.warning(f"sub_df columns: {sub_df.columns.tolist()}")
-                raise ValueError("Missing 'collateral_sub_category' in the filtered data.")
+                logger.error("Missing 'collateral_sub-category' in sub_df.")
+                raise ValueError("Missing 'collateral_sub-category' in the filtered data.")
 
             valid_subsubs = sorted(sub_df["collateral_sub-category"].dropna().unique())
-            totals = {}
-            total_val = 0
+            total_val = sub_df["adjusted_collateral_value"].sum()
+
+            data = []
             for sub in valid_subsubs:
-                total = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
-                totals[sub.lower().replace(" ", "_")] = total
-                total_val += total
+                subtotal = sub_df[sub_df["collateral_sub-category"] == sub]["adjusted_collateral_value"].sum()
+                data.append({
+                    "collateral_type": sub.lower().replace(" ", "_"),
+                    "total": round(subtotal),
+                    "percentage": round((subtotal / total_val) * 100) if total_val else 0
+                })
 
-            result = {
-                sub: round((val / total_val) * 100) if total_val else 0
-                for sub, val in totals.items()
+            return {
+                "collateral_parent_type": sub_category_level,
+                "data": data
             }
-            result["title"] = f"Collateral Distribution by Sub-Category ({sub_category_level})"
-            return result
-
 
         valid_categories = sorted(df["collateral_category"].dropna().unique())
-        totals = {}
-        total_val = 0
+        total_val = df["adjusted_collateral_value"].sum()
+
+        data = []
         for cat in valid_categories:
-            total = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
-            totals[cat.lower().replace(" ", "_")] = total
-            total_val += total
-        result = {
-            cat: round((value / total_val) * 100) if total_val else 0
-            for cat, value in totals.items()
+            subtotal = df[df["collateral_category"] == cat]["adjusted_collateral_value"].sum()
+            data.append({
+                "collateral_type": cat.capitalize(),
+                "total": round(subtotal),
+                "percentage": round((subtotal / total_val) * 100) if total_val else 0
+            })
+
+        return {
+            "collateral_parent_type": category_level,
+            "data": data
         }
-        result["title"] = f"Collateral Distribution by Category ({category_level})"
-        return result
+
+
 
     
     def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
@@ -6040,6 +6029,11 @@ class CoverageRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
             }
         }
 
+class CoverageRatioSingleResult(BaseModel):
+    numerator: str
+    denominator: str
+    coverage_ratio: float
+    
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
 
@@ -6142,15 +6136,17 @@ class ErrorResponse(BaseModel):
     description="Computes sum(total_hc_collateral) / sum(exposure) with optional filters and groupings."
 )
 def coverage_ratio_endpoint(
+    numerator_field: str = Query(..., description="Numerator field (e.g., 'hc_collateral_building')"),
+    denominator_field: str = Query("exposure", description="Denominator field (default is 'exposure')"),
     group_by_field: Optional[str] = Query(None, description="Optional group by field (e.g., 'sector')"),
     date_filter: Optional[str] = Query(None, description="Optional date filter (dd/mm/yyyy)"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'sector')"),
-    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'Financials')")
+    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'region')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'South')")
 ):
     try:
         result = risk_model.get_coverage_ratio(
-            numerator_field="total_hc_collateral",
-            denominator_field="exposure",
+            numerator_field=numerator_field,
+            denominator_field=denominator_field,
             group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
@@ -6165,91 +6161,125 @@ def coverage_ratio_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
-#SuccessResponse Model
+class CollateralDistributionData(BaseModel):
+    collateral_type: str
+    total: int
+    percentage: int
+
 class CollateralDistributionResponse(BaseModel):
-    title: str
-    distribution: Dict[str, int]
-#ErrorResponse Model
+    collateral_parent_type: str  # changed from collateral_type
+    data: List[CollateralDistributionData]  # changed from distribution
+    
+# ✅ ErrorResponse Model (unchanged)
 class ErrorResponse(BaseModel):
     error: str
-    
+
+# ✅ Updated route with correct response model
 @app.get(
     "/collateral_distribution",
     response_model=CollateralDistributionResponse,
-    responses={
-        200: {
-            "description": "Returns collateral distribution by category and sub-category.",
-            "content": {
-                "application/json": {
-                    "examples": {
-                        "By Category": {
-                            "summary": "Distribution by category only",
-                            "value": {
-                                "title": "Collateral Distribution by Category (Collateral Land & Building)",
-                                "distribution": {
-                                    "building": 55,
-                                    "land": 45
+    responses = {
+    200: {
+        "description": "Returns collateral distribution by category and sub-category.",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "By Category": {
+                        "summary": "Distribution by category only",
+                        "value": {
+                            "collateral_parent_type": "Collateral Land & Building",
+                            "data": [
+                                {
+                                    "collateral_type": "Building",
+                                    "total": 18397961064,
+                                    "percentage": 50
+                                },
+                                {
+                                    "collateral_type": "Land",
+                                    "total": 18279990342,
+                                    "percentage": 50
                                 }
-                            }
-                        },
-                        "By Sub-Category": {
-                            "summary": "Distribution by sub-category within a category",
-                            "value": {
-                                "title": "Collateral Distribution by Sub-Category (Building)",
-                                "distribution": {
-                                    "warehouse": 40,
-                                    "office": 30,
-                                    "factory": 30
+                            ]
+                        }
+                    },
+                    "By Sub-Category": {
+                        "summary": "Distribution by sub-category within a category",
+                        "value": {
+                            "collateral_parent_type": "Land",
+                            "data": [
+                                {
+                                    "collateral_type": "empty_land",
+                                    "total": 2236790052,
+                                    "percentage": 35
+                                },
+                                {
+                                    "collateral_type": "farm_land",
+                                    "total": 2903966370,
+                                    "percentage": 45
+                                },
+                                {
+                                    "collateral_type": "other_functioning_land",
+                                    "total": 1311081831,
+                                    "percentage": 20
                                 }
-                            }
+                            ]
                         }
                     }
                 }
             }
-        },
-        400: {
-            "model": ErrorResponse,
-            "description": "Unexpected internal error.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
-                    }
-                }
-            }
-        },
-        404: {
-            "model": ErrorResponse,
-            "description": "Collateral data not found.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "error": "Collateral data is not available."
-                    }
-                }
-            }
-        },
-        422: {
-            "description": "Validation error — invalid date or parameters.",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "detail": [
-                            {
-                                "loc": ["query", "category_level"],
-                                "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
-                                "type": "value_error"
-                            },
-                            {
-                                "loc": ["query", "date"],
-                                "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
-                                "type": "value_error"
-                            }
-                        ]
-                    }
+        }
+    },
+    400: {
+        "model": ErrorResponse,
+        "description": "Unexpected internal error.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 400,
+                    "message": "Bad Request",
+                    "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
                 }
             }
         }
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "Collateral data not found.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 404,
+                    "message": "Collateral data is not available.",
+                    "details": None
+                }
+            }
+        }
+    },
+    422: {
+        "model": ErrorResponse,
+        "description": "Validation error — invalid date or parameters.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "code": 422,
+                    "message": "Validation Error",
+                    "details": [
+                        {
+                            "loc": ["query", "category_level"],
+                            "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
+                            "type": "value_error"
+                        },
+                        {
+                            "loc": ["query", "date"],
+                            "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
+                            "type": "value_error"
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
     },
     summary="Get Collateral Distribution",
     description="Returns the distribution of collateral by category and optionally by sub-category for a given date. Supports haircut adjustments."
@@ -6268,10 +6298,7 @@ def collateral_distribution(
             apply_haircut=haircut
         )
 
-        return CollateralDistributionResponse(
-            title=result.pop("title"),
-            distribution=result
-        )
+        return result  # Directly return the data as is
 
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=[{
