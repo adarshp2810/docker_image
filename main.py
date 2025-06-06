@@ -2510,23 +2510,22 @@ class RiskDataModel:
     def get_top_collaterals(self, collateral_type: str, date_filter: str, top_n: Optional[int] = 10) -> List[Dict[str, Any]]:
         import os
         from urllib.parse import unquote
+        from typing import Optional
 
         # Define slugify and resolve_slug inside this method
         def slugify(name: str) -> str:
             return name.strip().lower().replace(" ", "_").replace("&", "and")
 
-        def resolve_slug(slug: str, valid_options: list) -> str | None:
+        def resolve_slug(slug: str, valid_options: list) -> Optional[str]:
             normalized_map = {slugify(option): option for option in valid_options}
             return normalized_map.get(slugify(unquote(slug)))
 
-        # Validate collateral_type against your valid types (assuming you have this list in self.valid_collateral_types)
+        # Validate collateral_type against your valid types
         collateral_type_actual = resolve_slug(collateral_type, self.valid_collateral_types)
         if not collateral_type_actual:
             raise ValueError(f"Invalid collateral_type: '{collateral_type}'")
 
         collateral_type = collateral_type_actual
-
-        # ... rest of your existing code unchanged ...
 
         if self.df_collateral is None or self.df_fact_risk is None:
             raise FileNotFoundError("Missing collateral or fact_risk data.")
