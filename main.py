@@ -6209,119 +6209,123 @@ class ErrorResponse(BaseModel):
 @app.get(
     "/collateral_distribution",
     response_model=CollateralDistributionResponse,
-    responses = {
-    200: {
-        "description": "Returns collateral distribution by category and sub-category.",
-        "content": {
-            "application/json": {
-                "examples": {
-                    "By Category": {
-                        "summary": "Distribution by category only",
-                        "value": {
-                            "collateral_parent_type": "Collateral Land & Building",
-                            "data": [
-                                {
-                                    "collateral_type": "Building",
-                                    "total": 18397961064,
-                                    "percentage": 50
-                                },
-                                {
-                                    "collateral_type": "Land",
-                                    "total": 18279990342,
-                                    "percentage": 50
-                                }
-                            ]
+    responses={
+        200: {
+            "description": "Returns collateral distribution by category and sub-category.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "By Category": {
+                            "summary": "Distribution by category only",
+                            "value": {
+                                "collateral_parent_type": "collateral_land_&_building",
+                                "data": [
+                                    {
+                                        "collateral_type": "building",
+                                        "total": 11828254410,
+                                        "percentage": 65
+                                    },
+                                    {
+                                        "collateral_type": "land",
+                                        "total": 6451657056,
+                                        "percentage": 35
+                                    }
+                                ]
+                            }
+                        },
+                        "By Sub-Category": {
+                            "summary": "Distribution by sub-category within a category",
+                            "value": {
+                                "collateral_parent_type": "land",
+                                "data": [
+                                    {
+                                        "collateral_type": "empty_land",
+                                        "total": 2236805109,
+                                        "percentage": 35
+                                    },
+                                    {
+                                        "collateral_type": "farm_land",
+                                        "total": 2903538006,
+                                        "percentage": 45
+                                    },
+                                    {
+                                        "collateral_type": "other_functioning_land",
+                                        "total": 1311313941,
+                                        "percentage": 20
+                                    }
+                                ]
+                            }
                         }
-                    },
-                    "By Sub-Category": {
-                        "summary": "Distribution by sub-category within a category",
-                        "value": {
-                            "collateral_parent_type": "Land",
-                            "data": [
-                                {
-                                    "collateral_type": "empty_land",
-                                    "total": 2236790052,
-                                    "percentage": 35
-                                },
-                                {
-                                    "collateral_type": "farm_land",
-                                    "total": 2903966370,
-                                    "percentage": 45
-                                },
-                                {
-                                    "collateral_type": "other_functioning_land",
-                                    "total": 1311081831,
-                                    "percentage": 20
-                                }
-                            ]
-                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 400,
+                        "message": "Bad Request",
+                        "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Collateral data not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 404,
+                        "message": "Collateral data is not available.",
+                        "details": None
+                    }
+                }
+            }
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "Validation error — invalid date or parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 422,
+                        "message": "Validation Error",
+                        "details": [
+                            {
+                                "loc": ["query", "category_level"],
+                                "msg": "Invalid collateral type: 'XYZ'. Allowed: ['collateral_land_&_building', 'shares']",
+                                "type": "value_error"
+                            },
+                            {
+                                "loc": ["query", "date"],
+                                "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
+                                "type": "value_error"
+                            }
+                        ]
                     }
                 }
             }
         }
     },
-    400: {
-        "model": ErrorResponse,
-        "description": "Unexpected internal error.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 400,
-                    "message": "Bad Request",
-                    "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
-                }
-            }
-        }
-    },
-    404: {
-        "model": ErrorResponse,
-        "description": "Collateral data not found.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 404,
-                    "message": "Collateral data is not available.",
-                    "details": None
-                }
-            }
-        }
-    },
-    422: {
-        "model": ErrorResponse,
-        "description": "Validation error — invalid date or parameters.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 422,
-                    "message": "Validation Error",
-                    "details": [
-                        {
-                            "loc": ["query", "category_level"],
-                            "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
-                            "type": "value_error"
-                        },
-                        {
-                            "loc": ["query", "date"],
-                            "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
-                            "type": "value_error"
-                        }
-                    ]
-                }
-            }
-        }
-    }
-
-    },
     summary="Get Collateral Distribution",
     description="Returns the distribution of collateral by category and optionally by sub-category for a given date. Supports haircut adjustments."
 )
+
 def collateral_distribution(
-    category_level: str = Query(..., description="Collateral type, e.g., 'Collatral Land & Building'"),
-    sub_category_level: Optional[str] = Query(None, description="Optional sub-category like 'Building', 'Land', 'Shares'"),
+    category_level: str = Query(..., description="Collateral type, e.g., 'collateral_land_&_building'"),
+    sub_category_level: Optional[str] = Query(None, description="Optional sub-category like 'building', 'land', 'shares'"),
     date: str = Query(..., description="Date in DD/MM/YYYY format"),
     haircut: bool = Query(False, description="Whether to apply haircut adjustment")
 ):
     try:
+        # Optional backward compatibility fix
+        if category_level == "collatral_land_and_building":
+            category_level = "collateral_land_%26_building"
+
         result = risk_model.get_collateral_distribution(
             category_level=category_level,
             sub_category_level=sub_category_level,
@@ -6329,7 +6333,7 @@ def collateral_distribution(
             apply_haircut=haircut
         )
 
-        return result  # Directly return the data as is
+        return result
 
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=[{
@@ -6371,9 +6375,12 @@ class ErrorResponse(BaseModel):
     message: str
     details: Optional[str] = None
     
+from fastapi import Query, HTTPException
+from typing import Optional, List, Dict, Any
+from fastapi.responses import JSONResponse
+
 @app.get(
-    "/api/top_collaterals",
-    
+    "/api_top_collaterals",
     summary="Get Top Collateral Items",
     description="Returns the top collateral items for a given type and date, with an optional limit on the result size.",
     responses={
@@ -6383,32 +6390,42 @@ class ErrorResponse(BaseModel):
                 "application/json": {
                     "example": [
                         {
-                            "date": "31/12/2022",
-                            "collateral_name": "Building1",
+                            "date": "31/12/2023",
+                            "collateral_name": "Building3",
                             "type": "Collateral Land & Building",
-                            "grade": 4.0,
-                            "collateral_value": 6427101.5,
-                            "hc_collateral_value": 3213550.75,
+                            "grade": 2,
+                            "collateral_value": 139535892.5,
+                            "hc_collateral_value": 69767946.25,
                             "customers": [
                                 {
-                                    "customer_name": "SABIC",
-                                    "customer_exposure": 101537501.0,
-                                    "customer_hc_collateral": 3213550.75
+                                    "customer_name": "National Commercial Bank",
+                                    "customer_exposure": 98785689,
+                                    "customer_hc_collateral": 24702811.25
+                                },
+                                {
+                                    "customer_name": "Almarai",
+                                    "customer_exposure": 113793117,
+                                    "customer_hc_collateral": 14200973.5
+                                },
+                                {
+                                    "customer_name": "Commercial Bank",
+                                    "customer_exposure": 69329856,
+                                    "customer_hc_collateral": 11421999.5
                                 }
                             ]
                         },
                         {
-                            "date": "31/12/2022",
-                            "collateral_name": "SharesXYZ",
-                            "type": "Shares",
-                            "grade": 3.5,
-                            "collateral_value": 5000000.0,
-                            "hc_collateral_value": 2500000.0,
+                            "date": "31/12/2023",
+                            "collateral_name": "Land9",
+                            "type": "Collateral Land & Building",
+                            "grade": 4,
+                            "collateral_value": 11738764.5,
+                            "hc_collateral_value": 5869382.25,
                             "customers": [
                                 {
-                                    "customer_name": "CorpA",
-                                    "customer_exposure": 75000000.0,
-                                    "customer_hc_collateral": 2500000.0
+                                    "customer_name": "Qatar Islamic Bank",
+                                    "customer_exposure": 108752312,
+                                    "customer_hc_collateral": 5869382.25
                                 }
                             ]
                         }
@@ -6458,10 +6475,12 @@ class ErrorResponse(BaseModel):
     }
 )
 def get_top_collaterals(
-    type: str = Query(..., description="Collateral type (e.g., 'Collatral Land & Building', 'Collateral Shares & Other Paper Assests')"),
-    date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2022')"),
+    type: str = Query(..., description="Collateral type (e.g., 'collateral_land_&_building')"),
+    date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2023')"),
     top_n: Optional[int] = Query(None, description="Maximum number of top items to return")
 ):
+    ...
+
     """
     Retrieve the top collateral items based on type, date, and an optional limit.
     """
