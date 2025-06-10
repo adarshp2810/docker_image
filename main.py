@@ -5179,7 +5179,10 @@ def aggregated_metrics_by_field(
             dimension_filter_value=dimension_filter_value,
             additional_field=additional_field
         )
+        if isinstance(result, dict):
+            result = [result]
         return result
+
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
 
