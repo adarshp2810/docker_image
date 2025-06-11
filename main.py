@@ -5332,7 +5332,7 @@ class ErrorResponse(BaseModel):
     description="Returns grouped distribution of a fact field (like exposure or collateral) by a categorical dimension, with optional filtering and haircut adjustment."
 )
 def get_dynamic_distribution_api(
-    fact_field: str = Query("total_collateral", description="Numeric field to aggregate ('total_collateral' or collateral type)"),
+    fact_field: str = Query("total_collateral", description="Numeric field to aggregate ('total_collateral')"),
     group_by_field: str = Query("collateral_type", description="Categorical field to group by"),
     date_filter: Optional[str] = Query(None, description="Date filter in DD/MM/YYYY"),
     dimension_filter_field: Optional[str] = Query(None, description="Filter field (e.g., 'group_id')"),
