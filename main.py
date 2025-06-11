@@ -244,6 +244,9 @@ class RiskDataModel:
             )
         self.df_joined["coverage_ratio"] = round(self.df_joined["coverage_ratio"]*100, 2)
         self.df_joined["ecl"] = round(self.df_joined["ecl"]*100, 2)
+        self.df_joined = self.df_joined.rename(columns={col: f'additional_provision_at_{int(float(col)*100)}_percent'
+                   for col in self.df_joined.columns
+                   if col.replace('.', '', 1).isdigit()})
 
     def _join_collateral(self):
         if self.df_collateral is None or self.df_customer is None:
@@ -469,57 +472,42 @@ class RiskDataModel:
     self,
     dimension,
     date_filter=None,
-    dimension_filter_field=None,
-    dimension_filter_value=None,
-    groupby_field=None
-    ):
+    compare_date: Optional[str] = None,
+    dimension_filters: Optional[str] = None,
+    groupby_field=None):
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
-
         df = self.df_joined.copy()
-        fields = {"group", "group_id", "cust_id", "rating"}
-
         if dimension not in df.columns:
             raise ValueError(f"Fact field '{dimension}' is not found.")
-
+        
         if groupby_field and groupby_field not in df.columns:
-            raise ValueError(f"Groupby field '{groupby_field}' is not found.")
-
+            raise ValueError(f"Group by field '{groupby_field}' is not found.")
+        
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
-        if date_filter:
-            try:
-                date_obj = pd.to_datetime(date_filter, dayfirst=True)
-                df = df[df["date"] == date_obj]
-            except Exception:
-                raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
-
-        if dimension_filter_field:
-            if dimension_filter_field not in df.columns:
-                raise ValueError(f"Dimension filter '{dimension_filter_field}' is not found.")
-
-            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]) and dimension_filter_field not in fields:
-                raise ValueError(f"Numeric field '{dimension_filter_field}' is not allowed as a dimension filter.")
-
-            if dimension_filter_value:
-                is_valid = (
-                    (dimension_filter_field in fields and int(dimension_filter_value) in df[dimension_filter_field].dropna().unique()) or
-                    (str(dimension_filter_value) in df[dimension_filter_field].astype(str).unique())
-                )
-                if not is_valid:
-                    raise ValueError(f"Dimension value '{dimension_filter_value}' is not found in the dimension filter '{dimension_filter_field}'.")
-
-                if dimension_filter_field in fields:
-                    df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
                 else:
-                    df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+        for field, value in filters_dict.items():
+            if pd.api.types.is_numeric_dtype(df[field]):
+                df = df[df[field] == pd.to_numeric(value, errors='coerce')]
             else:
-                raise ValueError("Dimension filter value is missing for the given dimension filter.")
+                df = df[df[field].astype(str) == str(value)]
 
         if df.empty:
-            raise FileNotFoundError("No data found after applying filters.")
+           raise FileNotFoundError("No data found after applying filters.")
 
+        result = {}
+        
+        all_groups = None
         if groupby_field:
-            # Get full list of group values based on field source
             if groupby_field == "rating":
                 all_groups = sorted(self.df_rating["internal_rating"].dropna().astype(int).unique())
             elif groupby_field == "group":
@@ -528,19 +516,42 @@ class RiskDataModel:
                 all_groups = sorted(self.df_customer["sector"].dropna().unique())
             else:
                 all_groups = sorted(df[groupby_field].dropna().unique())
+                
+        # Loop through both dates if given
+        for label, date_str in [("Base_count", date_filter), ("Other_count", compare_date)]:
+            if not date_str:
+                continue
 
-            grouped = df.groupby(groupby_field)[dimension].nunique().reset_index()
-            grouped_dict = {str(row[groupby_field]): int(row[dimension]) for _, row in grouped.iterrows()}
+            try:
+                date_val = pd.to_datetime(date_str, dayfirst=True)
+            except Exception:
+                raise ValueError(f"Invalid date format: '{date_str}'. Please use 'dd/mm/yyyy' format.")
 
-            # Ensure all groups are included, even if missing from data
-            result = {str(group): grouped_dict.get(str(group), 0) for group in all_groups}
-        else:
-            distinct_count = df[dimension].dropna().nunique()
-            result = {"count": distinct_count}
+            df_filtered = df[df["date"] == date_val]
 
-        if dimension_filter_field and dimension_filter_value:
-            result = {dimension_filter_field: dimension_filter_value, **result}
+            if df_filtered.empty:
+                if groupby_field:
+                    result.update({str(group): 0 for group in all_groups})
+                else:
+                    result[label] = 0
+                continue
 
+            if groupby_field:
+                grouped = df_filtered.groupby(groupby_field)[dimension].nunique().reset_index()
+                grouped_dict = {str(row[groupby_field]): int(row[dimension]) for _, row in grouped.iterrows()}
+                result.update({str(group): grouped_dict.get(str(group), 0) for group in all_groups})
+            else:
+                result[label] = df_filtered[dimension].dropna().nunique()
+        if not date_filter and not compare_date:
+            if groupby_field:
+                grouped = df.groupby(groupby_field)[dimension].nunique().reset_index()
+                grouped_dict = {str(row[groupby_field]): int(row[dimension]) for _, row in grouped.iterrows()}
+                for group in all_groups:
+                    result[str(group)] = grouped_dict.get(str(group), 0)
+            else:
+                result["count"] = df[dimension].dropna().nunique()
+
+        result.update(filters_dict)
         return result
 
     def get_concentration(self, fact_fields, group_by_fields=None, date_filter=None, top_n=10, dimension_filter_field=None, dimension_filter_value=None):
@@ -640,12 +651,15 @@ class RiskDataModel:
 
         return result
 
-    def get_portfolio_trend_summary(self, fact_fields, date_filter, period_type="M", lookback=5):
+    def get_portfolio_trend_summary(self, fact_fields, date_filter, period_type="M", lookback: Optional[int] = 5,compare_date: Optional[str] = None,dimension_filters: Optional[str] = None):
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
-        fields = {"group", "group_id", "cust_id","rating"}
+        fields = {"group", "group_id", "rating"}
+        selected_date = None
+        cmp_date=None
+        cmp =False
         # Validate fact_fields
         if fact_fields:
             for field in fact_fields:
@@ -655,9 +669,9 @@ class RiskDataModel:
 
                 if not pd.api.types.is_numeric_dtype(df[field]) or field in fields:
                     raise ValueError(f"Fact field must be a valid numeric field.")
-         
-        # date filter
+        
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
         if date_filter:
             try:
                 selected_date = pd.to_datetime(date_filter, dayfirst=True)
@@ -665,41 +679,66 @@ class RiskDataModel:
                 raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
         else:
             selected_date = df["date"].max() 
-              
+        
+        if compare_date:
+            try:
+                cmp_date = pd.to_datetime(compare_date, dayfirst=True)
+                cmp=True
+            except Exception:
+                raise ValueError(f"Invalid date format: '{compare_date}'. Please use 'dd/mm/yyyy' format.")
+        
+            
         if period_type not in ("M", "Q"):
             raise ValueError(f"Unexpected value;Only 'M' (monthly) or 'Q' (quarterly) are allowed.")
 
         if not isinstance(lookback, int) or lookback <= 0:
             raise ValueError("Invalid lookback value. It must be a positive integer greater than 0.")
         
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
+                else:
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+        
         # Setup periods
-        selected_date = pd.to_datetime(date_filter, dayfirst=True)
+
         df["period"] = df["date"].dt.to_period(period_type)
         df["period_str"] = df["period"].dt.strftime('%b, %Y')
+        if compare_date and cmp ==True :
+            compare_period = cmp_date.to_period(period_type)
+            filter_period = selected_date.to_period(period_type)
+            period_list = sorted([compare_period, filter_period ])       
+        else:
+            period_list = [
+                (selected_date - relativedelta(months=i if period_type == "M" else i * 3)).to_period(period_type)
+                for i in range(lookback + 1)]
+            
 
-        period_list = [(selected_date - relativedelta(months=i if period_type == "M" else i * 3)).to_period(period_type) for i in range(lookback + 1)]
-        period_strs = [p.strftime('%b, %Y') for p in period_list]
-
+        #period_list = [(selected_date - relativedelta(months=i if period_type == "M" else i * 3)).to_period(period_type) for i in range(lookback + 1)]
         df = df[df["period"].isin(period_list)]
-
-        # Create base output dictionary
         results = []
-
         for p in period_list:
             p_str = p.strftime('%b, %Y')
             df_p = df[df["period"] == p]
-
-            # Aggregate numeric fact fields
-            row = {
-                "period": p_str
-            }
-            for field in fact_fields:
-                if field in df_p.columns:
-                    row[field] = round(df_p[field].sum(), 0)
+            for field, value in filters_dict.items():
+                if pd.api.types.is_numeric_dtype(df_p[field]):
+                    df_p = df_p[df_p[field] == pd.to_numeric(value, errors='coerce')]
                 else:
-                    row[field] = None
+                    df_p = df_p[df_p[field].astype(str) == str(value)]
 
-            # Average rating logic
+            # handle numeric fact fields
+            row = {"period": p_str}
+            for field in fact_fields:
+                    if field in df_p.columns:
+                        row[field] = round(df_p[field].sum(), 0)
+                    else:
+                        row[field] = None
+                # Average rating 
             if "rating" in df_p.columns:
                 avg_rating = df_p["rating"].mean()
                 row["avg_rating_score"] = round(avg_rating, 1) if pd.notna(avg_rating) else None
@@ -707,7 +746,14 @@ class RiskDataModel:
                 row["avg_rating_score"] = None
 
             # Total unique customers
-            row["total_customers"] = df_p["cust_id"].nunique()
+            if "cust_id" in df_p.columns: 
+                row["total_customers"] = df_p["cust_id"].nunique()
+
+            if "provision" in fact_fields and "exposure" in fact_fields:
+                if (df_p["exposure"].sum() != 0):
+                    row["provision_percentage"] = round((df_p["provision"].sum() / df_p["exposure"].sum())*100, 2)
+                else:
+                    row["provision_percentage"] = None
 
             results.append(row)
             results.sort(key=lambda x: datetime.strptime(x["period"], "%b, %Y"))
@@ -715,6 +761,7 @@ class RiskDataModel:
                 for key, val in row.items():
                     if isinstance(val, (np.integer, np.floating)):
                         row[key] = val.item()
+            
 
         return results
 
@@ -1704,8 +1751,9 @@ class RiskDataModel:
     metrics: str,
     group_by_field: Optional[str] = None,
     date_filter: Optional[str] = None,
-    dimension_filter_field: Optional[str] = None,
-    dimension_filter_value: Optional[str] = None,
+    dimension_filters: Optional[str] = None,
+    top_n:Optional[int] = 10,
+    day_flag :Optional[int] = None,
     additional_field: Optional[str] = None):
 
         if not hasattr(self, "df_joined") or self.df_joined is None:
@@ -1730,7 +1778,7 @@ class RiskDataModel:
             
             metrics_dict[field.strip()] = agg_type.strip()
         
-        fields = {"group", "group_id", "cust_id","rating"}
+        fields = {"group", "group_id","rating","cust_id"}
         if group_by_field:
             if group_by_field not in df.columns:
                 raise ValueError(f"Group by field '{group_by_field}' is not found.")
@@ -1745,31 +1793,44 @@ class RiskDataModel:
                 df = df[df["date"] == date_obj]
             except Exception:
                 raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.") 
-
-        if dimension_filter_field:
-            if dimension_filter_field not in df.columns:
-                raise ValueError(f"Dimension filter '{dimension_filter_field}' is not found.")
             
-            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]) and dimension_filter_field not in fields:
-                raise ValueError(f"Numeric field '{dimension_filter_field}' is not allowed as a dimension filter.")
-
-            if dimension_filter_value:
-                is_valid = ((dimension_filter_field in fields  and
-                 int(dimension_filter_value) in df[dimension_filter_field].dropna().unique()) or
-                (str(dimension_filter_value) in df[dimension_filter_field].astype(str).unique()))
-                if not is_valid:
-                    raise ValueError(f"Dimension value '{dimension_filter_value}' is not found in the dimension filter '{dimension_filter_field}'.")
-
-                if dimension_filter_field in fields:
-                    df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    if pd.api.types.is_numeric_dtype(df[field]) and field not in fields:
+                        raise ValueError(f"Numeric field '{field}' is not allowed as a dimension filter.")
+                    filters_dict[field] = value
                 else:
-                    df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+        for field, value in filters_dict.items():
+            if pd.api.types.is_numeric_dtype(df[field]):
+                df = df[df[field] == pd.to_numeric(value, errors='coerce')]
             else:
-                raise ValueError("Dimension filter value is missing for the given dimension filter.")
+                df = df[df[field].astype(str) == str(value)]
+
+        if top_n is not None:
+            if not isinstance(top_n, int) or top_n <= 0:
+                raise ValueError("Invalid top_n: '{top_n}'.It must be a positive integer.")
         
-        if additional_field:
-            if additional_field not in df.columns:
-                raise ValueError(f"additional_field '{additional_field}' is not found.")
+
+        if day_flag is not None:
+            if not isinstance(day_flag, int) or day_flag not in [90, 180, 360]:
+                raise ValueError("day_flag must be one of [90, 180, 360]")
+            
+            if "dpd" not in df.columns:
+                raise ValueError("dpd field is required for day_flag filtering.")
+            
+            if day_flag == 90:
+                df = df[(df["dpd"] >= 61) & (df["dpd"] <= 89)]
+            elif day_flag == 180:
+                df = df[(df["dpd"] >= 151) & (df["dpd"] <= 179)]
+            elif day_flag == 360:
+                df = df[(df["dpd"] >= 331) & (df["dpd"] <= 359)]
 
         # Convert metric fields to numeric
         for field in metrics_dict:
@@ -1783,6 +1844,14 @@ class RiskDataModel:
 
             for group_val, group_df in grouped:
                 row = {group_by_field: group_val}
+
+                if group_by_field == "cust_id" and "cust_name" in df.columns:
+                    cust_name_val = group_df["cust_name"].dropna().iloc[0] if not group_df["cust_name"].dropna().empty else None
+                    row["cust_name"] = cust_name_val
+                elif group_by_field == "cust_name" and "cust_id" in df.columns:
+                    cust_id_val = group_df["cust_id"].dropna().iloc[0] if not group_df["cust_id"].dropna().empty else None
+                    row["cust_id"] = cust_id_val
+
                 for field, agg_type in metrics_dict.items():
                     if field not in group_df.columns:
                         row[field] = None
@@ -1790,10 +1859,14 @@ class RiskDataModel:
 
                     if agg_type == "sum":
                         value = group_df[field].sum()
+                        col_name = f"{field}_sum"
                     elif agg_type == "count":
                         value = group_df[field].nunique()
+                        col_name = f"{field}_count"
                     elif agg_type == "mean":
                         value = group_df[field].mean()
+                        col_name = f"{field}_mean"
+
                     elif agg_type == "weighted_average":
                         weight_field = "exposure"
                         if weight_field not in group_df.columns:
@@ -1801,13 +1874,14 @@ class RiskDataModel:
                         else:
                             w_sum = group_df[weight_field].sum()
                             value = (group_df[field] * group_df[weight_field]).sum() / w_sum if w_sum != 0 else 0
+                        col_name = field + "_wavg"
                     
 
                     if isinstance(value, (np.integer, np.int64)):
                         value = int(value)
                     elif isinstance(value, (np.floating, np.float64)):
                         value = round(float(value), 2)
-                    row[field] = value
+                    row[col_name] = value
 
                 if additional_field and additional_field in group_df.columns:
                     extra = group_df[additional_field].dropna().iloc[0] if not group_df[additional_field].dropna().empty else None
@@ -1816,6 +1890,9 @@ class RiskDataModel:
                     elif isinstance(extra, (np.floating, np.float64)):
                         extra = float(extra)
                     row[additional_field] = extra
+
+                if "exposure_sum" in row and "provision_sum" in row and row["exposure_sum"] != 0:
+                    row["provision_percentage"] = round((row["provision_sum"] / row["exposure_sum"]) * 100, 2)
 
                 result_list.append(row)
 
@@ -1835,24 +1912,45 @@ class RiskDataModel:
 
             # Merge full index with result
             result_df = pd.DataFrame(result_list)
-            final_df = pd.merge(full_index, result_df, on=group_by_field, how="left")
+            """final_df = pd.merge(full_index, result_df, on=group_by_field, how="left")
 
             # Fill missing values with 0 for numeric columns
             for col in final_df.columns:
-                if col != group_by_field and pd.api.types.is_numeric_dtype(final_df[col]):
-                    final_df[col] = final_df[col].fillna(0).round(2)
+               if col != group_by_field and pd.api.types.is_numeric_dtype(final_df[col]):
+                   final_df[col] = final_df[col].fillna(0).round(2)
 
-            result = final_df.to_dict(orient="records")
+            if top_n is not None and day_flag is not None:
+                if "exposure_sum" in final_df.columns:
+                    final_df = final_df.sort_values(by="exposure_sum", ascending=False).head(top_n)
 
-            # Prepend dimension filter field
-            if dimension_filter_field and dimension_filter_value:
-                header = {
-                    dimension_filter_field: (
-                        int(dimension_filter_value)
-                        if dimension_filter_field == "group"
-                        else dimension_filter_value
-                    )
-                }
+            result = final_df.to_dict(orient="records")"""
+            #if day_flag is  None:
+                
+
+            if day_flag and top_n  and  "exposure_sum" in result_df.columns and group_by_field  in ["cust_id","cust_name"]:
+                result_df = result_df.sort_values(by="exposure_sum", ascending=False).head(top_n)
+                # fill missing numeric columns with 0s (if any) — no merge with full_index needed
+                for col in result_df.columns:
+                    if col != group_by_field and pd.api.types.is_numeric_dtype(result_df[col]):
+                        result_df[col] = result_df[col].fillna(0).round(2)
+                result = result_df.to_dict(orient="records")
+            else:
+                final_df = pd.merge(full_index, result_df, on=group_by_field, how="left")
+                for col in final_df.columns:
+                    if col != group_by_field and pd.api.types.is_numeric_dtype(final_df[col]):
+                        final_df[col] = final_df[col].fillna(0).round(2)
+                result = final_df.to_dict(orient="records")
+    
+            header = {}
+            if filters_dict:
+                for field, value in filters_dict.items():
+                    header[field] = int(value) if field == "group" else value
+
+            if top_n and day_flag :
+                header["top_n"] = top_n
+                header["day_flag"] = day_flag
+                
+            if header:
                 return [header] + result
             else:
                 return result
@@ -1860,6 +1958,7 @@ class RiskDataModel:
         # Flat Aggregation
         else:
             result = {}
+            
             for field, agg_type in metrics_dict.items():
                 if field not in df.columns:
                     result[field] = None
@@ -1867,10 +1966,14 @@ class RiskDataModel:
 
                 if agg_type == "sum":
                     value = df[field].sum()
+                    col_name = f"{field}_sum"
                 elif agg_type == "count":
                     value = df[field].nunique()
+                    col_name = f"{field}_count"
                 elif agg_type == "mean":
                     value = df[field].mean()
+                    col_name = f"{field}_mean"
+
                 elif agg_type == "weighted_average":
                     weight_field = "exposure"
                     if weight_field not in df.columns:
@@ -1878,6 +1981,7 @@ class RiskDataModel:
                     else:
                         w_sum = df[weight_field].sum()
                         value = (df[field] * df[weight_field]).sum() / w_sum if w_sum != 0 else 0
+                    col_name = field + "_wavg"
                 else:
                     return {"error": f"Unsupported aggregation type: {agg_type}"}
 
@@ -1886,8 +1990,9 @@ class RiskDataModel:
                 elif isinstance(value, (np.floating, np.float64)):
                     value = round(float(value), 2)
 
-                result[field] = value
+                result[col_name] = value
 
+            
             if additional_field and additional_field in df.columns:
                 extra = df[additional_field].dropna().iloc[0] if not df[additional_field].dropna().empty else None
                 if isinstance(extra, (np.integer, np.int64)):
@@ -1895,18 +2000,17 @@ class RiskDataModel:
                 elif isinstance(extra, (np.floating, np.float64)):
                     extra = float(extra)
                 result[additional_field] = extra
+            if "exposure_sum" in result and "provision_sum" in result and result["exposure_sum"] != 0:
+                result["provision_percentage"] = round((result["provision_sum"] / result["exposure_sum"]) * 100, 2)
 
-            if dimension_filter_field and dimension_filter_value:
-                result = {
-                    dimension_filter_field: (
-                        int(dimension_filter_value)
-                        if dimension_filter_field == "group"
-                        else dimension_filter_value
-                    ),
-                    **result
-                }
+            if filters_dict:
+                header = {}
+                for field, value in filters_dict.items():
+                    header[field] = int(value) if field == "group" else value
+                result = {**header, **result}
 
             return result
+    
     
     def get_dynamic_distribution(
             self,
@@ -2007,7 +2111,6 @@ class RiskDataModel:
             item["percentage"] = round((item["total"] / total_sum * 100), 2) if total_sum > 0 else 0.0
 
         return {"data": result}
-
 
     def get_summary_table(self, date_filter: str, top_n: int = 10, filter_field: Optional[str] = None, filter_value: Optional[str] = None):
         df = self.df_joined.copy()
@@ -2141,20 +2244,23 @@ class RiskDataModel:
         return grp.to_dict("records")
 
     
-
     def get_customer_details(
         self,
         attributes: str,
         customer_fields: str,
         base_date: str,
         comparison_date: Optional[str] = None,
-        dimension_filters: Optional[str] = None
-    ):
+        top_n: Optional[int] = None,
+        period_type: Optional[str] = "M",
+        lookback: Optional[int] = None,
+        day_flag: Optional[int] = None,
+        dimension_filters: Optional[str] = None,):
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
-
+        filters_dict = {}
+        result_cust_df=pd.DataFrame()
         # Validate and parse inputs
         attributes = [attr.strip() for attr in attributes.split(',') if attr.strip()]
         customer_cols = [col.strip() for col in customer_fields.split(',') if col.strip()]
@@ -2174,7 +2280,31 @@ class RiskDataModel:
                 comp_date_obj = pd.to_datetime(comparison_date, dayfirst=True)
             except Exception:
                 raise ValueError(f"Invalid date format: '{comparison_date}'. Please use 'dd/mm/yyyy'.")
-
+        
+        if top_n is not None:
+            if not isinstance(top_n, int) or top_n <= 0:
+                raise ValueError("Invalid top_n: '{top_n}'.It must be a positive integer.")
+        
+        if period_type not in ("M", "Q"):
+            raise ValueError(f"Unexpected value;Only 'M' (monthly) or 'Q' (quarterly) are allowed.")
+        if lookback:
+            if not isinstance(lookback, int) or lookback <= 0:
+                raise ValueError("Invalid lookback value. It must be a positive integer greater than 0.")
+            
+        if day_flag is not None:
+            if not isinstance(day_flag, int) or day_flag not in [90, 180, 360]:
+                raise ValueError("day_flag must be one of [90, 180, 360]")
+            
+            if "dpd" not in df.columns:
+                raise ValueError("dpd field is required for day_flag filtering.")
+            
+            if day_flag == 90:
+                df = df[(df["dpd"] >= 61) & (df["dpd"] <= 89)]
+            elif day_flag == 180:
+                df = df[(df["dpd"] >= 151) & (df["dpd"] <= 179)]
+            elif day_flag == 360:
+                df = df[(df["dpd"] >= 331) & (df["dpd"] <= 359)]
+            
         # Helper to format Month-Year
         def format_month_year(date_str):
             date_obj = pd.to_datetime(date_str, dayfirst=True)
@@ -2192,13 +2322,12 @@ class RiskDataModel:
             if base_subset.empty:
                 raise FileNotFoundError("No data found for the specified base date.")
 
-            if comparison_date:
+            if comparison_date and lookback is None:
                 comp_label = format_month_year(comparison_date)
                 result["base_period"] = base_label
                 result["comparison_period"] = comp_label
 
                 if dimension_filters:
-                    filters_dict = {}
                     for pair in dimension_filters.split(','):
                         if ':' in pair:
                             field, value = [p.strip() for p in pair.split(':', 1)]
@@ -2208,10 +2337,9 @@ class RiskDataModel:
                             if pd.api.types.is_numeric_dtype(base_subset[field]):
                                 base_subset = base_subset[base_subset[field] == pd.to_numeric(value, errors='coerce')]
                             else:
-                                base_subset = base_subset[base_subset[field] == value]
+                                base_subset = base_subset[base_subset[field].astype(str) == str(value)]
                         else:
                             raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
-                    result["filters"] = filters_dict
 
                 if base_subset.empty:
                     raise FileNotFoundError("No data found after applying filters on base date.")
@@ -2223,18 +2351,73 @@ class RiskDataModel:
                 customer_cols_clean = [col for col in customer_cols if col != "cust_id"]
 
                 base_data = base_filtered[["cust_id"] + customer_cols_clean + attributes].drop_duplicates(subset=["cust_id"]).rename(
-                    columns={attr: f"{attr}_{base_label}" for attr in attributes}
-                )
+                columns={attr: f"{attr}_{base_label}" for attr in attributes})
                 comp_data = comp_subset[["cust_id"] + attributes].drop_duplicates(subset=["cust_id"]).rename(
-                    columns={attr: f"{attr}_{comp_label}" for attr in attributes}
-                )
+                columns={attr: f"{attr}_{comp_label}" for attr in attributes})
 
                 merged = pd.merge(base_data, comp_data, on="cust_id", how="left")
-                result["customers"] = merged.to_dict(orient="records")
+                result_cust_df=merged
+                #result["customers"] = merged.to_dict(orient="records")
+            elif lookback and period_type and comparison_date is None:
+                base_date_obj = pd.to_datetime(base_date)
+                period_list = [(base_date_obj - relativedelta(months=i if period_type == "M" else i * 3)).to_period(period_type) for i in range(lookback + 1)]
+                period_list = sorted(period_list, reverse=True)
+                #period_labels = [format_month_year(str(p)) for p in period_list] 
+                period_labels = []
+                for p in period_list:
+                    if period_type == "Q":
+                        date_str = p.end_time.strftime('%Y-%m-%d') 
+                    else:
+                        date_str = p.strftime('%Y-%m-%d')
+                    label = format_month_year(date_str)
+                    period_labels.append(label)
 
-            else:
+                # Assign period column as Period dtype
+                df["period"] = df["date"].dt.to_period(period_type)
+
+                base_period_obj = base_date_obj.to_period(period_type)
+                base_subset = df[df["period"] == base_period_obj]
+
+                if base_subset.empty:
+                    raise FileNotFoundError("No data found for the base period.")
+                
                 if dimension_filters:
-                    filters_dict = {}
+                    for pair in dimension_filters.split(','):
+                        if ':' in pair:
+                            field, value = [p.strip() for p in pair.split(':', 1)]
+                            if field not in base_subset.columns:
+                                raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                            if pd.api.types.is_numeric_dtype(base_subset[field]):
+                                base_subset = base_subset[base_subset[field] == pd.to_numeric(value, errors='coerce')]
+                            else:
+                                base_subset = base_subset[base_subset[field].astype(str) == str(value)]
+                        else:
+                            raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+                if base_subset.empty:
+                    raise FileNotFoundError("No data found after applying filters on base period.")
+
+                customer_ids = base_subset["cust_id"].unique()
+                customer_cols_clean = [col for col in customer_cols if col != "cust_id"]
+                # Prepare base period dataframe with renamed columns
+                base_data = base_subset[["cust_id"] + customer_cols_clean + attributes].drop_duplicates(subset=["cust_id"]).rename(columns={attr: f"{attr}_{period_labels[0]}" for attr in attributes})
+                merged_df = base_data.copy()
+                for i, period_date in enumerate(period_list[1:], start=1):
+                    period_label = period_labels[i]
+                    comp_subset = df[(df["period"] == period_date) & (df["cust_id"].isin(customer_ids))]
+                    if comp_subset.empty:
+                        zero_data = pd.DataFrame({"cust_id": customer_ids, **{f"{attr}_{period_label}": 0 for attr in attributes}})
+                        merged_df = pd.merge(merged_df, zero_data, on="cust_id", how="left")
+                        continue
+
+                    comp_data = comp_subset[["cust_id"] + attributes].drop_duplicates(subset=["cust_id"]).rename(columns={attr: f"{attr}_{period_label}" for attr in attributes})
+                    merged_df = pd.merge(merged_df, comp_data, on="cust_id", how="left")
+                result_cust_df = merged_df
+                result["base_period"] = period_labels[0]  
+                result["other_periods"] = period_labels[1:]
+                
+            elif lookback is None and comparison_date is None:
+                if dimension_filters:
                     for pair in dimension_filters.split(','):
                         if ':' in pair:
                             field, value = [p.strip() for p in pair.split(':', 1)]
@@ -2244,29 +2427,89 @@ class RiskDataModel:
                             if pd.api.types.is_numeric_dtype(df[field]):
                                 df = df[df[field] == pd.to_numeric(value, errors='coerce')]
                             else:
-                                df = df[df[field] == value]
+                                df = df[df[field].astype(str) == str(value)]
                         else:
                             raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
 
                 if df.empty:
                     raise FileNotFoundError("No data found after applying filters.")
-                
-                if dimension_filters:
-                    result["filters"] = filters_dict
+
                 result["base_period"] = base_label
-                base_result = df[df["date"] == base_date_obj][["cust_id"] + customer_cols + attributes].drop_duplicates(subset=["cust_id"])
-                result["customers"] = base_result.to_dict(orient="records")
+                #base_result = df[df["date"] == base_date_obj][["cust_id"] + customer_cols + attributes].drop_duplicates(subset=["cust_id"])
+                #result["customers"] = base_result.to_dict(orient="records")
+                result_cust_df = df[df["date"] == base_date_obj][["cust_id"] + customer_cols + attributes].drop_duplicates(subset=["cust_id"])
+            """if top_n:
+                exposure_col = f"exposure_{base_label}" if (comparison_date or lookback) else "exposure"
+                if exposure_col not in result_cust_df.columns:
+                    raise ValueError(f"Cannot sort by exposure. Exposure related column is not found.")
+                result_cust_df = result_cust_df.sort_values(by=exposure_col, ascending=False).head(top_n)"""
+            exposure_col = f"exposure_{base_label}" if (comparison_date or lookback) else "exposure"
+            if exposure_col not in result_cust_df.columns:
+                raise ValueError("Cannot sort by exposure. Exposure related column is not found.")
+            result_cust_df = result_cust_df.sort_values(by=exposure_col, ascending=False)
+            if top_n:
+                result_cust_df = result_cust_df.head(top_n)
+            
+            #result["customers"] = result_cust_df.to_dict(orient="records")
+            try:
+                #result["customers"] = result_cust_df.fillna(value=None).to_dict(orient="records")
+                result["customers"] = result_cust_df.replace({np.nan: None}).to_dict(orient="records")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error converting DataFrame: {e}")
+
+        if dimension_filters:
+            result["filters"] = filters_dict
 
         return result
+    
+    
+    def get_provision_distr_type(self, dimension_filters: Optional[str] = None, date_filter: Optional[str] = None):
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        if dimension_filters:
+            filters_dict = {}
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
+                else:
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+            for field, value in filters_dict.items():
+                if pd.api.types.is_numeric_dtype(df[field]):
+                    df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+                else:
+                    df = df[df[field].astype(str) == str(value)]
+
+        if date_filter:
+            try:
+                date_obj = pd.to_datetime(date_filter, dayfirst=True)
+                df = df[df["date"] == date_obj]
+            except Exception:
+                raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+        
+        if "direct_provision" in df.columns and "indirect_provision" in df.columns:
+            result = { "Direct": float(df["direct_provision"].sum()),
+            "Indirect": float(df["indirect_provision"].sum())}
+        else:
+            raise ValueError("Required columns 'direct_provision' and 'indirect_provision' not found in data.")
+        return result
+
 
     def get_transition_matrix(
         self,
         fact_field: str,
         base_date: str,
-        comparison_date: str,
+        comparison_date: Optional[str] = None,
         dimension_filters: Optional[str] = None,
-        output_mode: str = "absolute"
-    ):
+        column_field: Optional[str] = None,
+        output_mode: str = "absolute"):
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
@@ -2281,11 +2524,17 @@ class RiskDataModel:
             raise ValueError(f"Invalid output mode '{output_mode}'. Only 'absolute' or 'percentage' allowed.")
 
         # Validate and parse dates
-        try:
-            base_date_obj = pd.to_datetime(base_date, dayfirst=True)
-            comp_date_obj = pd.to_datetime(comparison_date, dayfirst=True)
-        except Exception:
-            raise ValueError(f"Invalid date format: '{base_date}' or '{comparison_date}'. Please use 'dd/mm/yyyy'.")
+        if base_date:
+            try:
+                base_date_obj = pd.to_datetime(base_date, dayfirst=True)
+            except Exception:
+                raise ValueError(f"Invalid base date format: '{base_date}'.Please use 'dd/mm/yyyy.")
+            
+        if comparison_date:
+            try:
+                comp_date_obj = pd.to_datetime(comparison_date, dayfirst=True)
+            except Exception:
+                raise ValueError(f"Invalid comparison date format:'{comparison_date}'. Please use 'dd/mm/yyyy'.")
 
         result = {}
 
@@ -2300,137 +2549,181 @@ class RiskDataModel:
                     if pd.api.types.is_numeric_dtype(df[field]):
                         df = df[df[field] == pd.to_numeric(value, errors='coerce')]
                     else:
-                        df = df[df[field] == value]
+                        df = df[df[field].astype(str) == str(value)]
                 else:
                     raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected format 'field:value'.")
 
         if df.empty:
             raise FileNotFoundError("No data available after applying dimension filters.")
 
-        base_label = base_date_obj.strftime('%b-%Y')
-        comp_label = comp_date_obj.strftime('%b-%Y')
-        result["base_period"] = base_label
-        result["comparison_period"] = comp_label
+        #base_label = base_date_obj.strftime('%b-%Y')
+        #comp_label = comp_date_obj.strftime('%b-%Y')
+        result["base_period"] = base_date_obj.strftime('%b-%Y')
+        if comparison_date:
+            result["comparison_period"] = comp_date_obj.strftime('%b-%Y')
+            base_df = df[df["date"] == base_date_obj][["cust_id", fact_field]].drop_duplicates(subset=["cust_id"]).rename(columns={fact_field: "base_value"})
+            comp_df = df[df["date"] == comp_date_obj][["cust_id", fact_field]].drop_duplicates(subset=["cust_id"]).rename(columns={fact_field: "comp_value"})
+            merged = pd.merge(comp_df, base_df, on="cust_id", how="outer")
+            if merged.empty:
+                raise FileNotFoundError("No matching records found between base and comparison dates.")
 
-        base_df = df[df["date"] == base_date_obj][["cust_id", fact_field]].drop_duplicates(subset=["cust_id"]).rename(columns={fact_field: "base_value"})
-        comp_df = df[df["date"] == comp_date_obj][["cust_id", fact_field]].drop_duplicates(subset=["cust_id"]).rename(columns={fact_field: "comp_value"})
-
-        merged = pd.merge(comp_df, base_df, on="cust_id", how="outer")
-        if merged.empty:
-            raise FileNotFoundError("No matching records found between base and comparison dates.")
-
-        merged["comp_value"] = merged["comp_value"].fillna("Unrated")
-        merged["base_value"] = merged["base_value"].fillna("Unrated")
-
-        merged["comp_value"] = merged.apply(
+            merged["comp_value"] = merged["comp_value"].fillna("Unrated")
+            merged["base_value"] = merged["base_value"].fillna("Unrated")
+            merged["comp_value"] = merged.apply(
             lambda x: "New" if x["comp_value"] == "Unrated" and x["base_value"] != "Unrated" else x["comp_value"], axis=1)
-        merged["base_value"] = merged.apply(
+            merged["base_value"] = merged.apply(
             lambda x: "Closed" if x["base_value"] == "Unrated" and x["comp_value"] != "Unrated" else x["base_value"], axis=1)
 
-        if fact_field == "rating":
-            all_cats = sorted(self.df_rating["internal_rating"].dropna().unique().astype(int).tolist())
-        elif fact_field == "group":
-            all_cats = sorted(self.df_customer["group_id"].dropna().unique().astype(int).tolist())
-        else:
-            all_cats = sorted(df[fact_field].dropna().unique().tolist(), key=str)
+            if fact_field == "rating":
+                all_cats = sorted(self.df_rating["internal_rating"].dropna().unique().astype(int).tolist())
+            elif fact_field == "group":
+                all_cats = sorted(self.df_customer["group_id"].dropna().unique().astype(int).tolist())
+            else:
+                all_cats = sorted(df[fact_field].dropna().unique().tolist(), key=str)
 
-        row_cats = all_cats + ["Unrated", "New"]
-        col_cats = all_cats + ["Unrated", "Closed"]
+            row_cats = all_cats + ["Unrated", "New"]
+            col_cats = all_cats + ["Unrated", "Closed"]
+            matrix = pd.DataFrame(0, index=row_cats, columns=col_cats)
+            for _, row in merged.iterrows():
+                matrix.loc[row["comp_value"], row["base_value"]] += 1
 
-        matrix = pd.DataFrame(0, index=row_cats, columns=col_cats)
+            matrix["Total"] = matrix.sum(axis=1)
+            total_row = matrix.sum(axis=0)
+            matrix.loc["Total"] = total_row
 
-        for _, row in merged.iterrows():
-            matrix.loc[row["comp_value"], row["base_value"]] += 1
+            if matrix.empty or matrix["Total"]["Total"] == 0:
+                raise FileNotFoundError("No data available to build transition matrix.")
 
-        matrix["Total"] = matrix.sum(axis=1)
-        total_row = matrix.sum(axis=0)
-        matrix.loc["Total"] = total_row
-
-        if matrix.empty or matrix["Total"]["Total"] == 0:
-            raise FileNotFoundError("No data available to build transition matrix.")
-
-        if output_mode == "percentage":
-            matrix = matrix.div(matrix.loc["Total", "Total"]).fillna(0).round(2) * 100
-
-        result["headers"] = [str(c) for c in matrix.columns]
-        result["rows"] = [str(r) for r in matrix.index]
-        result["values"] = matrix.values.tolist()
-
+            if output_mode == "percentage":
+                matrix = matrix.div(matrix.loc["Total", "Total"]).fillna(0).round(2) * 100
+            
+            result["headers"] = [str(c) for c in matrix.columns]
+            result["rows"] = [str(r) for r in matrix.index]
+            result["values"] = matrix.values.tolist()
+        elif column_field and comparison_date is None:
+            if column_field not in df.columns:
+                raise ValueError(f"Column field '{column_field}' is not found in the dataset.")
+    
+            single_date_df = df[df["date"] == base_date_obj]
+            if single_date_df.empty:
+                raise FileNotFoundError("No data available for base_date after filtering.")
+            if fact_field == "rating":
+                row_cats = sorted(self.df_rating["internal_rating"].dropna().unique().astype(int).tolist())
+            elif fact_field == "group":
+                row_cats = sorted(self.df_customer["group_id"].dropna().unique().astype(int).tolist())
+            else:
+                row_cats = sorted(df[fact_field].dropna().unique().tolist(), key=str)
+    
+            if column_field == "rating":
+                col_cats = sorted(self.df_rating["internal_rating"].dropna().unique().astype(int).tolist())
+            elif column_field == "group":
+                col_cats = sorted(self.df_customer["group_id"].dropna().unique().astype(int).tolist())
+            else:
+                col_cats = sorted(df[column_field].dropna().unique().tolist(), key=str)
+                
+            pivot = single_date_df.pivot_table(index=fact_field,columns=column_field,values="cust_id",
+                            aggfunc=lambda x: x.nunique(),fill_value=0)
+            
+            pivot = pivot.reindex(index=row_cats, columns=col_cats, fill_value=0)
+            pivot["Total"] = pivot.sum(axis=1)
+            total_row = pivot.sum(axis=0)
+            pivot.loc["Total"] = total_row
+            
+            if output_mode == "percentage":
+                total = pivot.loc["Total", "Total"]
+                if total == 0:
+                    raise ValueError("Cannot compute percentage. Total is zero.")
+                pivot = (pivot.div(total) * 100).fillna(0).round(2)
+            matrix = pivot
+            result["headers"] = [str(col) for col in matrix.columns]
+            result["rows"] = [str(idx) for idx in matrix.index]
+            result["values"] = matrix.values.tolist()
         return result
     
-    def get_coverage_ratio(
-        self,
-        numerator_field: str,
-        denominator_field: str = "exposure",
-        date_filter: Optional[str] = None,
-        dimension_filter_field: Optional[str] = None,
-        dimension_filter_value: Optional[str] = None,
-        group_by_field: Optional[str] = None
-    ) -> Dict[str, Any]:
-
+    def get_metric_ratio(
+    self,
+    numerator_field: str,
+    denominator_field: str = "exposure",
+    group_by_field: Optional[str] = None,
+    date_filter: Optional[str] = None,
+    dimension_filter_field: Optional[str] = None,
+    dimension_filter_value: Optional[str] = None
+    ):
         if not hasattr(self, "df_joined") or self.df_joined is None:
             raise FileNotFoundError("Source data is not found.")
 
         df = self.df_joined.copy()
 
-        # ✅ Validate required columns
+        # Validate fields
         for field in [numerator_field, denominator_field]:
             if field not in df.columns:
                 raise ValueError(f"Field '{field}' is not found in the dataset.")
+            
+        if numerator_field not in ["provision", "total_hc_collateral"]:
+            raise ValueError(f"'{numerator_field}' is not a valid numeric field.")
 
         if group_by_field and group_by_field not in df.columns:
             raise ValueError(f"Group by field '{group_by_field}' is not found in the dataset.")
 
-        # ✅ Apply date filter
+        if dimension_filter_field:
+            if dimension_filter_field not in df.columns:
+                raise ValueError(f"Dimension filter field '{dimension_filter_field}' is not found in the dataset.")
+            if dimension_filter_value is None:
+                raise ValueError("Dimension filter value is missing for the given dimension filter field.")
+
+        # Apply date filter
         df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
         if date_filter:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
             df = df[df["date"] == date_obj]
 
-        # ✅ Apply dimension filter
-        if dimension_filter_field:
-            if dimension_filter_field not in df.columns:
-                raise ValueError(f"Filter field '{dimension_filter_field}' is not found.")
-            if dimension_filter_value is None:
-                raise ValueError("Missing value for dimension filter.")
-            df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
+        # Apply dimension filter
+        if dimension_filter_field and dimension_filter_value:
+            if pd.api.types.is_numeric_dtype(df[dimension_filter_field]):
+                df = df[df[dimension_filter_field] == pd.to_numeric(dimension_filter_value, errors='coerce')]
+            else:
+                df = df[df[dimension_filter_field].astype(str) == str(dimension_filter_value)]
 
-        if df.empty:
-            raise FileNotFoundError("No data available after applying filters.")
-
-        # ✅ Grouping
+            if df.empty:
+                raise FileNotFoundError("No data available after applying filters.")
+            
+        label = "provision percentage" if numerator_field == "provision" else "coverage_ratio"
         if group_by_field:
             grouped = df.groupby(group_by_field).agg(
                 numerator_sum=(numerator_field, 'sum'),
                 denominator_sum=(denominator_field, 'sum')
             ).reset_index()
 
-            grouped["coverage_ratio"] = grouped.apply(
+            grouped[label] = grouped.apply(
                 lambda row: round((row["numerator_sum"] / row["denominator_sum"]) * 100, 2)
-                if row["denominator_sum"] else None,
-                axis=1
+                if row["denominator_sum"] != 0 else None, axis=1
             )
 
-            result = grouped[[group_by_field, "coverage_ratio"]].to_dict(orient="records")
-            if dimension_filter_field:
-                for row in result:
-                    row[dimension_filter_field] = dimension_filter_value
+            result = grouped[[group_by_field, label]].to_dict(orient="records")
+
+            if not result:
+                raise FileNotFoundError("No data available after applying filters and calculations.")
+
+            if dimension_filter_field and dimension_filter_value:
+                result.insert(0, {dimension_filter_field: dimension_filter_value})
+
             return result
 
-        # ✅ No group: just return single ratio
-        numerator_total = df[numerator_field].sum()
-        denominator_total = df[denominator_field].sum()
+        else:
+            numerator_sum = df[numerator_field].sum()
+            denominator_sum = df[denominator_field].sum()
 
-        if denominator_total == 0:
-            raise ZeroDivisionError("Denominator sum is zero — cannot compute coverage ratio.")
+            if denominator_sum == 0:
+                raise FileNotFoundError("No valid denominator found to compute coverage ratio.")
 
-        return {
-            "numerator": numerator_field,
-            "denominator": denominator_field,
-            "coverage_ratio": round((numerator_total / denominator_total) * 100, 2),
-            "dimension": dimension_filter_value if dimension_filter_field else None
-        }
- 
+            ratio = round((numerator_sum / denominator_sum) * 100, 2)
+
+            result = {label: ratio}
+            if dimension_filter_field and dimension_filter_value:
+                result = {dimension_filter_field: dimension_filter_value, **result}
+
+            return result 
+        
         
     from urllib.parse import unquote
 
@@ -3655,26 +3948,21 @@ class ErrorResponse(BaseModel):
 def count_distinct_values(
     dimension: str = Query(..., description="Dimension field to count distinct values from (e.g., 'cust_id')"),
     date_filter: Optional[str] = Query(None, description="Filter by date (format: dd/mm/yyyy)"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional field to filter on (e.g., 'sector')"),
-    dimension_filter_value: Optional[str] = Query(None, description="Value for the dimension filter (e.g., 'Financials')"),
-    groupby_field: Optional[str] = Query(None, description="Optional field to group by before counting (e.g., 'sector')")
-):
+    compare_date: Optional[str] = Query(None, description="Comparison date in dd/mm/yyyy format"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1"),
+    groupby_field: Optional[str] = Query(None, description="Optional field to group by before counting (e.g., 'sector')")):
+
     try:
         validate_field_names([dimension], "dimension")
-        if dimension_filter_field:
-            validate_field_names([dimension_filter_field], "dimension_filter_field")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
         if groupby_field:
             validate_field_names([groupby_field], "groupby_field")
 
-        result = risk_model.count_distinct(
-            dimension,
-            date_filter,
-            dimension_filter_field,
-            dimension_filter_value,
-            groupby_field
-        )
+        result = risk_model.count_distinct(dimension,date_filter,compare_date,dimension_filters,groupby_field)
         return result or {"count": 0}  
-
+        
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
 
@@ -3686,6 +3974,7 @@ def count_distinct_values(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
 
 #endpoint: get_concentration-----------------
 # Success Response Model ---
@@ -3981,17 +4270,23 @@ def portfolio_trend(
     fact_fields: str = Query(..., description="Comma-separated fact fields to aggregate, e.g. 'exposure,direct_exposure'"),
     date_filter: str = Query(..., description="End date for the trend period in dd/mm/yyyy format"),
     period_type: Literal["M", "Q"] = Query("M", description="Period granularity: 'M' for monthly, 'Q' for quarterly"),
-    lookback: int = Query(5, description="Number of periods (months or quarters) to look back")):
+    lookback: Optional[int]= Query(5, description="Number of periods (months or quarters) to look back"),
+    compare_date: Optional[str] = Query(None, description="Comparison date in dd/mm/yyyy format"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1")):
     try:
         fact_field_list = [field.strip() for field in fact_fields.split(",") if field.strip()]
-
         validate_field_names(fact_field_list, "fact_fields")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
 
         result = risk_model.get_portfolio_trend_summary(
             fact_fields=fact_field_list,
             date_filter=date_filter,
             period_type=period_type,
-            lookback=lookback)
+            lookback=lookback,
+            compare_date=compare_date,
+            dimension_filters=dimension_filters)
         return result
 
     except ValueError as ve:
@@ -5089,7 +5384,9 @@ def weighted_average_trend(
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
 # --- Success Response Model ---
-class AggregatedMetricsResponse( RootModel[List[Dict[str, Union[str, float, int]]]]):
+class AggregatedMetricsResponse(  RootModel[Union[
+        Dict[str, Union[str, float, int]],
+        List[Dict[str, Union[str, float, int]]] ]]):
     class Config:
         json_schema_extra = {
             "example": [{"rating": 1,"exposure": 549773740,"pd": 0},{"rating": 2,"exposure": 1369028386,"pd": 0.02},
@@ -5193,37 +5490,35 @@ def validate_metrics(metrics_str: str):
 )
 
 def aggregated_metrics_by_field(
-    metrics: str = Query(..., description="Comma-separated metrics with aggregation types, e.g. 'exposure:sum,pd:weighted_average'"),
-    group_by_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
-    date_filter: Optional[str] = Query(None, description="Date filter in 'dd/mm/yyyy' format"),
-    dimension_filter_field: Optional[str] = Query(None, description="Field name to apply a dimension filter on"),
-    dimension_filter_value: Optional[str] = Query(None, description="Value of the dimension filter field"),
-    additional_field: Optional[str] = Query(None, description="Field to include as-is in results without aggregation")
-):
+    metrics: str = Query(..., description="Comma-separated metrics with aggregation types, e.g. 'exposure:sum,provision:weighted_average'"),
+    group_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
+    date_filter: Optional[str] = Query(None, description="Date filter in 'dd/mm/yyyy' format for example 31/12/2024"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1"),
+    top_n: Optional[int] = Query(10, description="Maximum number of top items to return."),
+    day_flag: Optional[int] = Query(None, description="Number of days must be one of [90, 180, 360] "),
+    additional_field: Optional[str] = Query(None, description="Field to include as-is in results without aggregation Eg.pd"),
+    ):
     try:
         validate_metrics(metrics)
         for f in metrics.split(","):
             validate_field_names([f.split(":")[0]], "metrics")
-
-        if group_by_field:
-            validate_field_names([group_by_field], "group_by_field")
-        if dimension_filter_field:
-            validate_field_names([dimension_filter_field], "dimension_filter_field")
+        if group_field:
+            validate_field_names([group_field], "group_field")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
         if additional_field:
             validate_field_names([additional_field], "additional_field")
             
         result = risk_model.get_aggregated_metrics_by_field(
             metrics=metrics,
-            group_by_field=group_by_field,
+            group_by_field=group_field,
             date_filter=date_filter,
-            dimension_filter_field=dimension_filter_field,
-            dimension_filter_value=dimension_filter_value,
-            additional_field=additional_field
-        )
-        if isinstance(result, dict):
-            result = [result]
+            dimension_filters=dimension_filters,
+            top_n=top_n,
+            day_flag=day_flag,
+            additional_field=additional_field)
         return result
-
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
 
@@ -5250,7 +5545,6 @@ class ErrorResponse(BaseModel):
     code: int = Field(..., description="HTTP status code returned by the API")
     message: str = Field(..., description="Explanation of what went wrong")
     details: Optional[str] = Field(None, description="Detailed context or debugging info (if available)")
-
 
 @app.get(
     "/dynamic-distribution",
@@ -5400,7 +5694,7 @@ def get_dynamic_distribution_api(
                 details=str(e)
             ).dict()
         )
-        
+
 from fastapi.responses import JSONResponse
 from fastapi import status
 # --- Success Response Model ---
@@ -5742,45 +6036,44 @@ class ErrorResponse(BaseModel):
 def exposure_coverage_by_rating(
     fact_fields: str = Query(..., description="Comma-separated fields (first must be 'exposure')"),
     date_filter: str = Query(..., description="Date in DD/MM/YYYY format"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional filter dimension (e.g., sector, group_id)"),
-    dimension_filter_value: Optional[str] = Query(None, description="Value of the filter dimension")
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1")
 ):
     try:
+        # Validate and convert fact_fields to metrics format expected by model
         fields = [f.strip() for f in fact_fields.split(",")]
         if not fields or fields[0] != "exposure":
             raise HTTPException(status_code=400, detail="The first fact field must be 'exposure'")
 
-        metrics_str = ",".join([
-            f"{field}:mean" if field == "pd" else f"{field}:sum" for field in fields
-        ])
+        # Create the metrics string in the format expected by model function
+        # 'exposure:sum,total_hc_collateral:sum' etc.
+        metrics = ",".join([f"{field}:mean" if field == "pd" else f"{field}:sum" for field in fields])
 
+        # Call the actual model function using mapped arguments
         result = risk_model.get_aggregated_metrics_by_field(
-            metrics=metrics_str,
+            metrics=metrics,
             group_by_field="rating",
             date_filter=date_filter,
-            dimension_filter_field=dimension_filter_field,
-            dimension_filter_value=dimension_filter_value
+            dimension_filters=dimension_filters,
         )
 
+        # If no result
         if not result:
             raise HTTPException(status_code=404, detail="No data found")
 
+        # Add coverage ratio calculations
         for row in result:
-            exposure = row.get("exposure", 0)
+            exposure = row.get("exposure_sum", 0)
             if exposure:
                 for field in fields[1:]:
-                    val = row.get(field, 0)
-                    if isinstance(val, (int, float)):
-                        row[f"{field}_coverage_ratio"] = round(val / exposure * 100, 2)
+                    field_sum_key = f"{field}_sum"
+                    field_val = row.get(field_sum_key, 0)
+                    if isinstance(field_val, (int, float)):
+                        row[f"{field}_coverage_ratio"] = round(field_val / exposure * 100, 2)
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=result)
 
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=f"Invalid date format: {ve}")
-
     except HTTPException:
         raise
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
@@ -5788,7 +6081,10 @@ def exposure_coverage_by_rating(
 class CustomerDetailsResponse(BaseModel):
     base_period: str
     comparison_period: Optional[str] = None
-    customers: List[Dict[str, Union[str, int, float]]]
+    other_periods: Optional[List[str]] = None
+    filters: Optional[Dict[str, Union[str, int, float]]] = None 
+    #customers: List[Dict[str, Union[str, int, float]]]
+    customers: List[Dict[str, Optional[Union[str, int, float]]]]
 
 class ErrorResponse(BaseModel):
     error: str
@@ -5895,6 +6191,10 @@ def customer_details(
     customer_fields: str = Query(..., description="Comma-separated identity fields, e.g., cust_id,cust_name"),
     base_date: str = Query(..., description="Base date in dd/mm/yyyy format"),
     comparison_date: Optional[str] = Query(None, description="Comparison date in dd/mm/yyyy format"),
+    top_n: Optional[int] = Query(None, description="Maximum number of top items to return."),
+    period_type: Literal["M", "Q"] = Query("M", description="Period granularity: 'M' for monthly, 'Q' for quarterly"),
+    lookback: Optional[int]= Query(None, description="Number of periods (months or quarters) to look back"),
+    day_flag: Optional[int] = Query(None, description="Number of days must be one of [90, 180, 360] "),
     dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Retail,rating:1")
 ):
     try:
@@ -5912,10 +6212,100 @@ def customer_details(
             customer_fields=customer_fields,
             base_date=base_date,
             comparison_date=comparison_date,
-            dimension_filters=dimension_filters
-        )
+            top_n=top_n,
+            period_type=period_type,
+            lookback=lookback,
+            day_flag=day_flag,
+            dimension_filters=dimension_filters)
         return result
 
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+
+    except HTTPException as http_exc:
+        raise http_exc
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
+#--end point : provision distribution by provision type---------
+class ProvisionDistributionTypeResponse(RootModel[Dict[str, Union[float, int]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {"Direct": 12331655640.048,
+                "Indirect": 9775225757.36928
+                }
+            
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"error": "Column 'sector' not found in the dataset."}
+        }
+
+@app.get(
+    "/provision_distribution_type",
+    response_model=ProvisionDistributionTypeResponse,
+    responses={
+        200: {
+            "description": "Returns the percentage distribution of a fact field across the given dimension.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "provision distribution by type ",
+                            "value":  {"Direct": 12331655640.048,
+                                        "Indirect": 9775225757.36928}
+                        },
+                        "With Dimension Filter": {
+                            "summary": "provision distribution by type using date filter ",
+                            "value":  {"Direct": 65760842.99831998,
+                                       "Indirect": 20483415.34504}
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid inputs or internal error"
+        },
+        422: {
+            "description": "Validation error for query parameters",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {"loc": ["query", "stage_filter"], "msg": "Invalid staging value: '3cc'. Available values are: 3, 2, 3D, 3E, 3C, 1"},
+                            {"loc": ["query", "date_filter"], "msg": "invalid date format, expected 'dd/mm/yyyy'", "type": "value_error.date"},
+                            
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Provision Distribution by provision Type ",
+    description="Calculates the provision distribution by provision type using  optional stage value and date filter."
+)
+def get_provision_distr_type(
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filters like staging:3C,group:1"),
+    #stage_filter: Optional[str] = Query(None, description="Staging value Eg.1,2,3,3C etc.(optional) "),
+    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format (optional)")):
+    try:
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
+
+        result = risk_model.get_provision_distr_type(dimension_filters=dimension_filters,date_filter=date_filter)
+        return result
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
 
@@ -5931,7 +6321,7 @@ def customer_details(
 # --------- Response Models ---------
 class TransitionMatrixResponse(BaseModel):
     base_period: str
-    comparison_period: str
+    comparison_period: Optional[str] = None
     headers: List[str]
     rows: List[str]
     values: List[List[Union[int, float]]]
@@ -6054,8 +6444,9 @@ class ErrorResponse(BaseModel):
 def transition_matrix(
     fact_field: str = Query(..., description="Field to track transitions, e.g., rating"),
     base_date: str = Query(..., description="Base date (T+1) in dd/mm/yyyy"),
-    comparison_date: str = Query(..., description="Comparison date (T) in dd/mm/yyyy"),
+    comparison_date: Optional[str] = Query(None, description="Comparison date (T) in dd/mm/yyyy"),
     dimension_filters: Optional[str] = Query(None, description="Comma-separated filters like sector:Retail,group:1"),
+    column_field: Optional[str] = Query(None, description=" A secondary field ,that is useful for comparing how 'fact_field' values distribute across another dimension"),
     output_mode: str = Query("absolute", description="absolute or percentage")
 ):
     try:
@@ -6064,14 +6455,17 @@ def transition_matrix(
         if dimension_filters:
             filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
             validate_field_names(filter_fields, "dimension_filters")
+        if column_field:
+            validate_field_names([column_field], "column_field")
+
 
         result = risk_model.get_transition_matrix(
             fact_field=fact_field,
             base_date=base_date,
             comparison_date=comparison_date,
             dimension_filters=dimension_filters,
-            output_mode=output_mode
-        )
+            column_field=column_field,
+            output_mode=output_mode)
         return result
 
     except ValueError as ve:
@@ -6086,7 +6480,8 @@ def transition_matrix(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
 
-class CoverageRatioGroupResult(RootModel[List[Dict[str, Union[str, float]]]]):
+## end point 
+class MetricRatioGroupResult(RootModel[List[Dict[str, Union[str, float]]]]):
     class Config:
         json_schema_extra = {
             "example": [
@@ -6096,7 +6491,7 @@ class CoverageRatioGroupResult(RootModel[List[Dict[str, Union[str, float]]]]):
             ]
         }
 
-class CoverageRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
+class MetricRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
     class Config:
         json_schema_extra = {
             "example": {
@@ -6105,11 +6500,6 @@ class CoverageRatioSingleResult(RootModel[Dict[str, Union[str, float]]]):
             }
         }
 
-class CoverageRatioSingleResult(BaseModel):
-    numerator: str
-    denominator: str
-    coverage_ratio: float
-    
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="Error message")
 
@@ -6121,11 +6511,11 @@ class ErrorResponse(BaseModel):
         }
 
 @app.get(
-    "/coverage_ratio",
-    response_model=Union[CoverageRatioGroupResult, CoverageRatioSingleResult],
+    "/metric_ratio",
+    response_model=Union[MetricRatioGroupResult, MetricRatioSingleResult],
     responses={
         200: {
-            "description": "Returns coverage ratio for total_hc_collateral over exposure, optionally grouped by a dimension.",
+            "description": "Returns  ratio for total_hc_collateral OR provision over exposure, optionally grouped by a dimension.",
             "content": {
                 "application/json": {
                     "examples": {
@@ -6208,28 +6598,32 @@ class ErrorResponse(BaseModel):
             }
         }
     },
-    summary="Calculate Coverage Ratio",
-    description="Computes sum(total_hc_collateral) / sum(exposure) with optional filters and groupings."
+    summary="Calculate Ratio",
+    description="Computes sum(a valid numeric field) / sum(exposure) with optional filters and groupings."
 )
-def coverage_ratio_endpoint(
-    numerator_field: str = Query(..., description="Numerator field (e.g., 'hc_collateral_building')"),
-    denominator_field: str = Query("exposure", description="Denominator field (default is 'exposure')"),
+def metric_ratio_endpoint(
+    fact_field: str = Query(..., description="A valid Numerator field, e.g., 'provision' or 'total_hc_collateral'"),
     group_by_field: Optional[str] = Query(None, description="Optional group by field (e.g., 'sector')"),
     date_filter: Optional[str] = Query(None, description="Optional date filter (dd/mm/yyyy)"),
-    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'region')"),
-    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'South')")
+    dimension_filter_field: Optional[str] = Query(None, description="Optional filter field (e.g., 'sector')"),
+    dimension_filter_value: Optional[str] = Query(None, description="Optional filter value (e.g., 'Financials')")
 ):
     try:
-        result = risk_model.get_coverage_ratio(
-            numerator_field=numerator_field,
-            denominator_field=denominator_field,
+        validate_field_names([fact_field], "fact_field")
+        if group_by_field:
+            validate_field_names([group_by_field], "group_by_field")
+        if dimension_filter_field:
+            validate_field_names([dimension_filter_field], "dimension_filter_field")
+
+        result = risk_model.get_metric_ratio(
+            numerator_field=fact_field,
+            denominator_field="exposure",
             group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value
         )
         return result
-
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=str(ve))
     except FileNotFoundError as fnf:
