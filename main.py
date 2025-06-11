@@ -2013,76 +2013,104 @@ class RiskDataModel:
     
     
     def get_dynamic_distribution(
-        self,
-        fact_field: str,
-        group_by_field: str = "collateral_type",
-        date_filter: Optional[str] = None,
-        dimension_filter_field: Optional[str] = None,
-        dimension_filter_value: Optional[str] = None,
-        apply_haircut: bool = False,
-        source: str = "collateral"  # NEW PARAM
-    ) -> Dict[str, List[Dict[str, Union[str, int, float]]]]:
+            self,
+            fact_field: str,
+            group_by_field: str = "collateral_type",
+            date_filter: Optional[str] = None,
+            dimension_filter_field: Optional[str] = None,
+            dimension_filter_value: Optional[str] = None,
+            apply_haircut: bool = False,
+            source: str = "risk"
+        ) -> Dict[str, List[Dict[str, Union[str, int, float]]]]:
 
-        # Choose data source
-        if source == "collateral":
-            if self.df_collateral_joined is None:
-                return {"error": "No joined collateral data available"}
-            df = self.df_collateral_joined.copy()
-        elif source == "risk":
-            if self.df_joined is None:
-                return {"error": "No joined fact risk data available"}
-            df = self.df_joined.copy()
-        else:
-            return {"error": f"Unknown source '{source}'. Valid options: 'collateral', 'risk'"}
+        if source != "risk":
+            return {"error": f"Unsupported source '{source}'. Only 'risk' is allowed."}
 
-        # Date filtering
+        if self.df_joined is None:
+            return {"error": "No joined fact risk data available"}
+
+        df = self.df_joined.copy()
+
+        # --- Normalize column names early ---
+        df.columns = (
+            df.columns
+            .str.strip()
+            .str.lower()
+            .str.replace(",", "")      # remove commas first
+            .str.replace("&", "and")   # replace ampersands
+            .str.replace(" ", "_")     # then replace spaces
+        )
+
+        print("\n--- Available Columns After Normalization ---")
+        print(df.columns.tolist())
+        print(df.head(2))
+
+        # Validate fact_field and group_by_field
+        if fact_field != "total_collateral":
+            return {"error": "Fact field must be 'total_collateral' only."}
+
+        if group_by_field != "collateral_type":
+            return {"error": "Group by field must be 'collateral_type' only."}
+
+        # Apply date filter
         if date_filter:
             try:
                 df["date"] = pd.to_datetime(df["date"], dayfirst=True)
                 df = df[df["date"] == pd.to_datetime(date_filter, dayfirst=True)]
-            except:
-                raise HTTPException(status_code=400, detail="Invalid date format. Use DD/MM/YYYY.")
+            except Exception:
+                return {"error": "Invalid date format. Use DD/MM/YYYY."}
 
-        # Dimension filter
+        # Optional dimension filter
+        valid_filters = ["cust_id", "sector", "group_id"]
         if dimension_filter_field and dimension_filter_value:
-            if dimension_filter_field not in df.columns:
-                return {"error": f"Column '{dimension_filter_field}' not found in the dataset."}
-            if dimension_filter_field == "group_id":
+            field = dimension_filter_field.strip().lower().replace(" ", "_")
+            if field not in df.columns or field not in valid_filters:
+                return {"error": f"Invalid filter field '{dimension_filter_field}'. Must be one of {valid_filters}."}
+
+            if field == "group_id":
                 try:
-                    df = df[df[dimension_filter_field] == int(dimension_filter_value)]
+                    df = df[df[field] == int(dimension_filter_value)]
                 except ValueError:
                     return {"error": f"Invalid value '{dimension_filter_value}' for group_id; must be an integer."}
             else:
-                df = df[df[dimension_filter_field].astype(str).str.lower() == str(dimension_filter_value).lower()]
+                df = df[df[field].astype(str).str.lower() == str(dimension_filter_value).lower()]
 
         if df.empty:
             return {"error": "No data after applying filters."}
 
-        # Validate required fields
-        if fact_field not in df.columns:
-            return {"error": f"Fact field '{fact_field}' not found in dataset."}
-        if group_by_field not in df.columns:
-            return {"error": f"Group by field '{group_by_field}' not found in dataset."}
+        # Corrected column keys
+        column_map = {
+            False: {
+                "collateral_land_and_building": "Collateral Land & Building",
+                "collateral_cash_gold_and_other_riskfree_assests": "Collateral Cash, Gold & Other Riskfree Assets",
+                "collateral_shares_and_other_paper_assests": "Collateral Shares & Other Paper Assets",
+                "collateral_hawalat_haq": "Others"
+            },
+            True: {
+                "hc_collateral_building": "Collateral Land & Building",
+                "hc_collateral_cash": "Collateral Cash, Gold & Other Riskfree Assets",
+                "hc_collateral_shares": "Collateral Shares & Other Paper Assets",
+                "hc_collateral_hawalat_haq": "Others"
+            }
+        }
 
-        # Apply haircut if needed
-        if apply_haircut and "hair_cut" in df.columns:
-            df["haircut"] = df["hair_cut"].apply(lambda x: safe_float(str(x).replace("%", "")) / 100 if isinstance(x, str) else 0)
-            df["value"] = df[fact_field] * (1 - df["haircut"])
-        else:
-            df["value"] = df[fact_field]
+        selected_columns = column_map[apply_haircut]
+        result = []
+        total_sum = 0
 
-        # Aggregate
-        grouped = (
-            df.groupby(group_by_field)["value"]
-            .sum()
-            .reset_index()
-            .rename(columns={"value": "total"})
-        )
-        grouped["total"] = grouped["total"].round(0).astype(int)
-        total_sum = grouped["total"].sum()
-        grouped["percentage"] = (grouped["total"] / total_sum * 100).round(2) if total_sum > 0 else 0.0
+        for col, display_name in selected_columns.items():
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(",", "").fillna("0").astype(float)
+                col_sum = df[col].sum()
+            else:
+                col_sum = 0
+            result.append({"collateral_type": display_name, "total": int(col_sum), "percentage": 0.0})
+            total_sum += col_sum
 
-        return {"data": grouped.to_dict("records")}
+        for item in result:
+            item["percentage"] = round((item["total"] / total_sum * 100), 2) if total_sum > 0 else 0.0
+
+        return {"data": result}
 
     def get_summary_table(self, date_filter: str, top_n: int = 10, filter_field: Optional[str] = None, filter_value: Optional[str] = None):
         df = self.df_joined.copy()
@@ -2710,7 +2738,6 @@ class RiskDataModel:
         if self.df_collateral_joined is None:
             raise FileNotFoundError("Collateral data is not available.")
 
-        # Local utilities (won't affect other APIs)
         def slugify(name: str) -> str:
             return name.strip().lower().replace(" ", "_").replace("&", "and")
 
@@ -2721,7 +2748,6 @@ class RiskDataModel:
             normalized_map = {slugify(option): option for option in valid_options}
             return normalized_map.get(slugify(unquote(slug)))
 
-        # Resolve slugs
         category_level_actual = resolve_slug(category_level, self.valid_collateral_types)
         if not category_level_actual:
             raise ValueError(f"Invalid category_level: '{category_level}'")
@@ -2733,16 +2759,23 @@ class RiskDataModel:
             if not sub_level_actual:
                 raise ValueError(f"Invalid sub_category_level: '{sub_category_level}'")
 
-        # Parse date
         try:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
         except Exception:
             raise ValueError(f"Invalid date format: '{date_filter}' (Expected dd/mm/yyyy)")
 
         df = self.df_collateral_joined.copy()
-        df = df[(df["collateral_type"] == category_level_actual) & (df["date"] == date_obj)]
+        df = df[
+            (df["collateral_type"] == category_level_actual) &
+            (df["date"] == date_obj)
+        ]
 
-        # Haircut
+        # ✅ Deduplicate rows to avoid inflated totals from joins or double entries
+        df = df.drop_duplicates(subset=[
+            "customer_id", "collateral_value", "collateral_type",
+            "collateral_category", "collateral_sub-category", "date"
+        ])
+
         df["hair_cut"] = (
             pd.to_numeric(df["hair_cut"].astype(str).str.replace('%', ''), errors="coerce")
             .fillna(0) / 100
@@ -2762,6 +2795,13 @@ class RiskDataModel:
         # Sub-category view
         if sub_level_actual:
             sub_df = df[df["collateral_category"] == sub_level_actual]
+
+            # ✅ Optional safety deduplication again at sub-level (edge case)
+            sub_df = sub_df.drop_duplicates(subset=[
+                "customer_id", "collateral_value", "collateral_type",
+                "collateral_category", "collateral_sub-category", "date"
+            ])
+
             if "collateral_sub-category" not in sub_df.columns:
                 raise ValueError("Missing 'collateral_sub-category' in filtered data.")
 
@@ -5511,30 +5551,30 @@ class ErrorResponse(BaseModel):
     response_model=DynamicDistributionResponse,
     responses={
         200: {
-            "description": "Distribution retrieved successfully",
+            "description": "Distribution retrieved successfully.",
             "content": {
                 "application/json": {
                     "example": {
                         "data": [
                             {
-                                "collateral_type": "Collatral Cash, Gold & Other Riskfree Assests",
-                                "total": 13601165184,
-                                "percentage": 23.8
+                                "collateral_type": "Collateral Land & Building",
+                                "total": 1011295337,
+                                "percentage": 20.43
                             },
                             {
-                                "collateral_type": "Collatral Land & Building",
-                                "total": 14875403184,
-                                "percentage": 26.03
+                                "collateral_type": "Collateral Cash, Gold & Other Riskfree Assets",
+                                "total": 832945157,
+                                "percentage": 16.82
                             },
                             {
-                                "collateral_type": "Collatral Shares & Other Paper Assests",
-                                "total": 10688965254,
-                                "percentage": 18.7
+                                "collateral_type": "Collateral Shares & Other Paper Assets",
+                                "total": 1114673154,
+                                "percentage": 22.51
                             },
                             {
                                 "collateral_type": "Others",
-                                "total": 17985930048,
-                                "percentage": 31.47
+                                "total": 1802960480,
+                                "percentage": 36.42
                             }
                         ]
                     }
@@ -5543,7 +5583,7 @@ class ErrorResponse(BaseModel):
         },
         400: {
             "model": ErrorResponse,
-            "description": "Bad Request — Unexpected internal error",
+            "description": "Bad Request – Unexpected error.",
             "content": {
                 "application/json": {
                     "example": {
@@ -5556,7 +5596,7 @@ class ErrorResponse(BaseModel):
         },
         404: {
             "model": ErrorResponse,
-            "description": "Not Found — Required source data missing",
+            "description": "Not Found – Required source data missing",
             "content": {
                 "application/json": {
                     "example": {
@@ -5569,7 +5609,7 @@ class ErrorResponse(BaseModel):
         },
         422: {
             "model": ErrorResponse,
-            "description": "Unprocessable Entity — Invalid input format or field",
+            "description": "Unprocessable Entity – Invalid input format or field",
             "content": {
                 "application/json": {
                     "example": {
@@ -5582,13 +5622,13 @@ class ErrorResponse(BaseModel):
         },
         500: {
             "model": ErrorResponse,
-            "description": "Internal Server Error — unexpected crash",
+            "description": "Internal Server Error – unexpected crash",
             "content": {
                 "application/json": {
                     "example": {
                         "code": 500,
                         "message": "Internal server error",
-                        "details": "Unexpected error occurred during distribution generation"
+                        "details": "Unexpected error during distribution generation"
                     }
                 }
             }
@@ -5598,12 +5638,12 @@ class ErrorResponse(BaseModel):
     description="Returns grouped distribution of a fact field (like exposure or collateral) by a categorical dimension, with optional filtering and haircut adjustment."
 )
 def get_dynamic_distribution_api(
-    fact_field: str = Query("collateral_value", description="Numeric field to aggregate ('collateral_value')"),
+    fact_field: str = Query("total_collateral", description="Numeric field to aggregate ('total_collateral')"),
     group_by_field: str = Query("collateral_type", description="Categorical field to group by"),
     date_filter: Optional[str] = Query(None, description="Date filter in DD/MM/YYYY"),
-    dimension_filter_field: Optional[str] = Query(None, description="Filter field (e.g. 'group_id')"),
+    dimension_filter_field: Optional[str] = Query(None, description="Filter field (e.g., 'group_id')"),
     dimension_filter_value: Optional[str] = Query(None, description="Filter value"),
-    apply_haircut: bool = Query(False, description="Apply haircut to the fact field if available")
+    apply_haircut: bool = Query(False, description="Apply haircut adjustment")
 ):
     try:
         result = risk_model.get_dynamic_distribution(
@@ -5612,7 +5652,8 @@ def get_dynamic_distribution_api(
             date_filter=date_filter,
             dimension_filter_field=dimension_filter_field,
             dimension_filter_value=dimension_filter_value,
-            apply_haircut=apply_haircut
+            apply_haircut=apply_haircut,
+            source="risk"
         )
 
         if "error" in result:
@@ -5653,7 +5694,6 @@ def get_dynamic_distribution_api(
                 details=str(e)
             ).dict()
         )
-
 
 from fastapi.responses import JSONResponse
 from fastapi import status
@@ -6608,119 +6648,123 @@ class ErrorResponse(BaseModel):
 @app.get(
     "/collateral_distribution",
     response_model=CollateralDistributionResponse,
-    responses = {
-    200: {
-        "description": "Returns collateral distribution by category and sub-category.",
-        "content": {
-            "application/json": {
-                "examples": {
-                    "By Category": {
-                        "summary": "Distribution by category only",
-                        "value": {
-                            "collateral_parent_type": "Collateral Land & Building",
-                            "data": [
-                                {
-                                    "collateral_type": "Building",
-                                    "total": 18397961064,
-                                    "percentage": 50
-                                },
-                                {
-                                    "collateral_type": "Land",
-                                    "total": 18279990342,
-                                    "percentage": 50
-                                }
-                            ]
+    responses={
+        200: {
+            "description": "Returns collateral distribution by category and sub-category.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "By Category": {
+                            "summary": "Distribution by category only",
+                            "value": {
+                                "collateral_parent_type": "collateral_land_&_building",
+                                "data": [
+                                    {
+                                        "collateral_type": "building",
+                                        "total": 11828254410,
+                                        "percentage": 65
+                                    },
+                                    {
+                                        "collateral_type": "land",
+                                        "total": 6451657056,
+                                        "percentage": 35
+                                    }
+                                ]
+                            }
+                        },
+                        "By Sub-Category": {
+                            "summary": "Distribution by sub-category within a category",
+                            "value": {
+                                "collateral_parent_type": "land",
+                                "data": [
+                                    {
+                                        "collateral_type": "empty_land",
+                                        "total": 2236805109,
+                                        "percentage": 35
+                                    },
+                                    {
+                                        "collateral_type": "farm_land",
+                                        "total": 2903538006,
+                                        "percentage": 45
+                                    },
+                                    {
+                                        "collateral_type": "other_functioning_land",
+                                        "total": 1311313941,
+                                        "percentage": 20
+                                    }
+                                ]
+                            }
                         }
-                    },
-                    "By Sub-Category": {
-                        "summary": "Distribution by sub-category within a category",
-                        "value": {
-                            "collateral_parent_type": "Land",
-                            "data": [
-                                {
-                                    "collateral_type": "empty_land",
-                                    "total": 2236790052,
-                                    "percentage": 35
-                                },
-                                {
-                                    "collateral_type": "farm_land",
-                                    "total": 2903966370,
-                                    "percentage": 45
-                                },
-                                {
-                                    "collateral_type": "other_functioning_land",
-                                    "total": 1311081831,
-                                    "percentage": 20
-                                }
-                            ]
-                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 400,
+                        "message": "Bad Request",
+                        "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Collateral data not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 404,
+                        "message": "Collateral data is not available.",
+                        "details": None
+                    }
+                }
+            }
+        },
+        422: {
+            "model": ErrorResponse,
+            "description": "Validation error — invalid date or parameters.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "code": 422,
+                        "message": "Validation Error",
+                        "details": [
+                            {
+                                "loc": ["query", "category_level"],
+                                "msg": "Invalid collateral type: 'XYZ'. Allowed: ['collateral_land_&_building', 'shares']",
+                                "type": "value_error"
+                            },
+                            {
+                                "loc": ["query", "date"],
+                                "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
+                                "type": "value_error"
+                            }
+                        ]
                     }
                 }
             }
         }
     },
-    400: {
-        "model": ErrorResponse,
-        "description": "Unexpected internal error.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 400,
-                    "message": "Bad Request",
-                    "details": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
-                }
-            }
-        }
-    },
-    404: {
-        "model": ErrorResponse,
-        "description": "Collateral data not found.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 404,
-                    "message": "Collateral data is not available.",
-                    "details": None
-                }
-            }
-        }
-    },
-    422: {
-        "model": ErrorResponse,
-        "description": "Validation error — invalid date or parameters.",
-        "content": {
-            "application/json": {
-                "example": {
-                    "code": 422,
-                    "message": "Validation Error",
-                    "details": [
-                        {
-                            "loc": ["query", "category_level"],
-                            "msg": "Invalid collateral type: 'XYZ'. Allowed: ['Collateral Land & Building', 'Shares']",
-                            "type": "value_error"
-                        },
-                        {
-                            "loc": ["query", "date"],
-                            "msg": "Invalid date format: '31-04-2024'. Please use 'dd/mm/yyyy'.",
-                            "type": "value_error"
-                        }
-                    ]
-                }
-            }
-        }
-    }
-
-    },
     summary="Get Collateral Distribution",
     description="Returns the distribution of collateral by category and optionally by sub-category for a given date. Supports haircut adjustments."
 )
+
 def collateral_distribution(
-    category_level: str = Query(..., description="Collateral type, e.g., 'Collatral Land & Building'"),
-    sub_category_level: Optional[str] = Query(None, description="Optional sub-category like 'Building', 'Land', 'Shares'"),
+    category_level: str = Query(..., description="Collateral type, e.g., 'collateral_land_&_building'"),
+    sub_category_level: Optional[str] = Query(None, description="Optional sub-category like 'building', 'land', 'shares'"),
     date: str = Query(..., description="Date in DD/MM/YYYY format"),
     haircut: bool = Query(False, description="Whether to apply haircut adjustment")
 ):
     try:
+        # Optional backward compatibility fix
+        if category_level == "collatral_land_and_building":
+            category_level = "collateral_land_%26_building"
+
         result = risk_model.get_collateral_distribution(
             category_level=category_level,
             sub_category_level=sub_category_level,
@@ -6728,7 +6772,7 @@ def collateral_distribution(
             apply_haircut=haircut
         )
 
-        return result  # Directly return the data as is
+        return result
 
     except ValueError as ve:
         raise HTTPException(status_code=422, detail=[{
@@ -6770,9 +6814,12 @@ class ErrorResponse(BaseModel):
     message: str
     details: Optional[str] = None
     
+from fastapi import Query, HTTPException
+from typing import Optional, List, Dict, Any
+from fastapi.responses import JSONResponse
+
 @app.get(
-    "/api/top_collaterals",
-    
+    "/api_top_collaterals",
     summary="Get Top Collateral Items",
     description="Returns the top collateral items for a given type and date, with an optional limit on the result size.",
     responses={
@@ -6782,32 +6829,42 @@ class ErrorResponse(BaseModel):
                 "application/json": {
                     "example": [
                         {
-                            "date": "31/12/2022",
-                            "collateral_name": "Building1",
+                            "date": "31/12/2023",
+                            "collateral_name": "Building3",
                             "type": "Collateral Land & Building",
-                            "grade": 4.0,
-                            "collateral_value": 6427101.5,
-                            "hc_collateral_value": 3213550.75,
+                            "grade": 2,
+                            "collateral_value": 139535892.5,
+                            "hc_collateral_value": 69767946.25,
                             "customers": [
                                 {
-                                    "customer_name": "SABIC",
-                                    "customer_exposure": 101537501.0,
-                                    "customer_hc_collateral": 3213550.75
+                                    "customer_name": "National Commercial Bank",
+                                    "customer_exposure": 98785689,
+                                    "customer_hc_collateral": 24702811.25
+                                },
+                                {
+                                    "customer_name": "Almarai",
+                                    "customer_exposure": 113793117,
+                                    "customer_hc_collateral": 14200973.5
+                                },
+                                {
+                                    "customer_name": "Commercial Bank",
+                                    "customer_exposure": 69329856,
+                                    "customer_hc_collateral": 11421999.5
                                 }
                             ]
                         },
                         {
-                            "date": "31/12/2022",
-                            "collateral_name": "SharesXYZ",
-                            "type": "Shares",
-                            "grade": 3.5,
-                            "collateral_value": 5000000.0,
-                            "hc_collateral_value": 2500000.0,
+                            "date": "31/12/2023",
+                            "collateral_name": "Land9",
+                            "type": "Collateral Land & Building",
+                            "grade": 4,
+                            "collateral_value": 11738764.5,
+                            "hc_collateral_value": 5869382.25,
                             "customers": [
                                 {
-                                    "customer_name": "CorpA",
-                                    "customer_exposure": 75000000.0,
-                                    "customer_hc_collateral": 2500000.0
+                                    "customer_name": "Qatar Islamic Bank",
+                                    "customer_exposure": 108752312,
+                                    "customer_hc_collateral": 5869382.25
                                 }
                             ]
                         }
@@ -6857,10 +6914,12 @@ class ErrorResponse(BaseModel):
     }
 )
 def get_top_collaterals(
-    type: str = Query(..., description="Collateral type (e.g., 'Collatral Land & Building', 'Collateral Shares & Other Paper Assests')"),
-    date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2022')"),
+    type: str = Query(..., description="Collateral type (e.g., 'collateral_land_&_building')"),
+    date_filter: str = Query(..., description="Date in DD/MM/YYYY format (e.g., '31/12/2023')"),
     top_n: Optional[int] = Query(None, description="Maximum number of top items to return")
 ):
+    ...
+
     """
     Retrieve the top collateral items based on type, date, and an optional limit.
     """
@@ -6906,3 +6965,4 @@ def get_top_collaterals(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", port=8000, reload=True)
+
