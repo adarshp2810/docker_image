@@ -2445,7 +2445,6 @@ class RiskDataModel:
         if self.df_collateral_joined is None:
             raise FileNotFoundError("Collateral data is not available.")
 
-        # Local utilities (won't affect other APIs)
         def slugify(name: str) -> str:
             return name.strip().lower().replace(" ", "_").replace("&", "and")
 
@@ -2456,7 +2455,6 @@ class RiskDataModel:
             normalized_map = {slugify(option): option for option in valid_options}
             return normalized_map.get(slugify(unquote(slug)))
 
-        # Resolve slugs
         category_level_actual = resolve_slug(category_level, self.valid_collateral_types)
         if not category_level_actual:
             raise ValueError(f"Invalid category_level: '{category_level}'")
@@ -2468,16 +2466,23 @@ class RiskDataModel:
             if not sub_level_actual:
                 raise ValueError(f"Invalid sub_category_level: '{sub_category_level}'")
 
-        # Parse date
         try:
             date_obj = pd.to_datetime(date_filter, dayfirst=True)
         except Exception:
             raise ValueError(f"Invalid date format: '{date_filter}' (Expected dd/mm/yyyy)")
 
         df = self.df_collateral_joined.copy()
-        df = df[(df["collateral_type"] == category_level_actual) & (df["date"] == date_obj)]
+        df = df[
+            (df["collateral_type"] == category_level_actual) &
+            (df["date"] == date_obj)
+        ]
 
-        # Haircut
+        # ✅ Deduplicate rows to avoid inflated totals from joins or double entries
+        df = df.drop_duplicates(subset=[
+            "customer_id", "collateral_value", "collateral_type",
+            "collateral_category", "collateral_sub-category", "date"
+        ])
+
         df["hair_cut"] = (
             pd.to_numeric(df["hair_cut"].astype(str).str.replace('%', ''), errors="coerce")
             .fillna(0) / 100
@@ -2497,6 +2502,13 @@ class RiskDataModel:
         # Sub-category view
         if sub_level_actual:
             sub_df = df[df["collateral_category"] == sub_level_actual]
+
+            # ✅ Optional safety deduplication again at sub-level (edge case)
+            sub_df = sub_df.drop_duplicates(subset=[
+                "customer_id", "collateral_value", "collateral_type",
+                "collateral_category", "collateral_sub-category", "date"
+            ])
+
             if "collateral_sub-category" not in sub_df.columns:
                 raise ValueError("Missing 'collateral_sub-category' in filtered data.")
 
