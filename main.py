@@ -5491,7 +5491,7 @@ def validate_metrics(metrics_str: str):
 
 def aggregated_metrics_by_field(
     metrics: str = Query(..., description="Comma-separated metrics with aggregation types, e.g. 'exposure:sum,provision:weighted_average'"),
-    group_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
+    group_by_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
     date_filter: Optional[str] = Query(None, description="Date filter in 'dd/mm/yyyy' format for example 31/12/2024"),
     dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1"),
     top_n: Optional[int] = Query(10, description="Maximum number of top items to return."),
@@ -5512,7 +5512,7 @@ def aggregated_metrics_by_field(
             
         result = risk_model.get_aggregated_metrics_by_field(
             metrics=metrics,
-            group_by_field=group_field,
+            group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filters=dimension_filters,
             top_n=top_n,
