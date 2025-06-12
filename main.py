@@ -5502,8 +5502,8 @@ def aggregated_metrics_by_field(
         validate_metrics(metrics)
         for f in metrics.split(","):
             validate_field_names([f.split(":")[0]], "metrics")
-        if group_field:
-            validate_field_names([group_field], "group_field")
+        if group_by_field:
+            validate_field_names([group_by_field], "group_by_field")
         if dimension_filters:
             filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
             validate_field_names(filter_fields, "dimension_filters")
