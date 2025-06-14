@@ -6788,6 +6788,25 @@ def collateral_distribution(
         logger.exception("Unexpected error in /collateral_distribution")
         raise HTTPException(status_code=400, detail={"error": f"An unexpected error occurred: {str(e)}"})
 
+import re
+
+def to_snake_case(s):
+    # Replace spaces and hyphens with underscores
+    s = re.sub(r'[\s\-]+', '_', s)
+
+    # Insert underscores between camelCase or PascalCase transitions (except acronyms like HC)
+    s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+
+    return s.lower()
+
+def convert_keys_to_snake_case(obj):
+    if isinstance(obj, dict):
+        return {to_snake_case(k): convert_keys_to_snake_case(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_keys_to_snake_case(item) for item in obj]
+    else:
+        return obj
+
 #SuccessResponse Model
 class CollateralCustomerItem(BaseModel):
     Customer_Name: str
@@ -6924,14 +6943,12 @@ def get_top_collaterals(
     Retrieve the top collateral items based on type, date, and an optional limit.
     """
     try:
-        # Call the risk_model method to get the top collaterals
         result = risk_model.get_top_collaterals(
             collateral_type=type,
             date_filter=date_filter,
             top_n=top_n
         )
 
-        # Check if the result is empty
         if not result:
             raise HTTPException(
                 status_code=404,
@@ -6941,17 +6958,15 @@ def get_top_collaterals(
                 ).dict()
             )
 
-        # Return the result; FastAPI will validate and serialize it to List[CollateralItem]
-        return result
+        # ✅ Convert result keys to snake_case just before returning
+        return convert_keys_to_snake_case(result)
 
     except ValueError as ve:
-        # Handle validation errors (e.g., invalid type or date format)
         raise HTTPException(
             status_code=422,
             detail=ErrorResponse(code=422, message=str(ve)).dict()
         )
     except Exception as e:
-        # Log unexpected errors and return a 500 response
         logger.error(f"Unexpected error in /api/top_collaterals: {str(e)}")
         raise HTTPException(
             status_code=500,
