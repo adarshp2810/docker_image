@@ -2087,9 +2087,9 @@ class RiskDataModel:
                 "collateral_hawalat_haq": "Others"
             },
             True: {
-                "hc_collateral_building": "Collateral Land & Building",
-                "hc_collateral_cash": "Collateral Cash, Gold & Other Riskfree Assets",
-                "hc_collateral_shares": "Collateral Shares & Other Paper Assets",
+                "hc_collateral_land_and_building": "Collateral Land & Building",
+                "hc_collateral_cash_gold_and_other_riskfree_assests": "Collateral Cash, Gold & Other Riskfree Assets",
+                "hc_collateral_shares_and_other_paper_assests": "Collateral Shares & Other Paper Assets",
                 "hc_collateral_hawalat_haq": "Others"
             }
         }
