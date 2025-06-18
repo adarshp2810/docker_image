@@ -2041,7 +2041,7 @@ class RiskDataModel:
                 all_vals = self.df_customer[group_by_field].dropna().unique()
                 full_index = pd.DataFrame({group_by_field: all_vals})
             else:
-                all_vals = df[group_by_field].dropna().unique()
+                all_vals = natsorted(df[group_by_field].dropna().astype(str).unique())
                 full_index = pd.DataFrame({group_by_field: all_vals})
 
             # Merge full index with result
