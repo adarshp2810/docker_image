@@ -2045,11 +2045,11 @@ class RiskDataModel:
             elif group_by_field in self.df_customer.columns:
                 all_vals = self.df_customer[group_by_field].dropna().unique()
                 full_index = pd.DataFrame({group_by_field: all_vals})
-            elif group_by_field == "staging":
-                series = self.df_joined["staging"].dropna()
-                cleaned_series = pd.Series(series).apply(lambda x: str(x).strip() if isinstance(x, str) else str(x))
-                all_vals = natsorted(cleaned_series.unique())
-                full_index = pd.DataFrame({group_by_field: all_vals})
+            # elif group_by_field == "staging":
+            #     series = self.df_joined["staging"].dropna()
+            #     cleaned_series = pd.Series(series).apply(lambda x: str(x).strip() if isinstance(x, str) else str(x))
+            #     all_vals = natsorted(cleaned_series.unique())
+            #     full_index = pd.DataFrame({group_by_field: all_vals})
             else:
                 all_vals = df[group_by_field].dropna().unique()
                 full_index = pd.DataFrame({group_by_field: all_vals})
