@@ -100,7 +100,7 @@ def load_data(folder: str, normalize_cols=True):
     if not os.path.exists(folder):
         raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
     
-    all_data = {"fact_risk": [], "customer": [], "risk_limit": [], "rating": [], "collateral": []}
+    all_data = {"fact_risk": [], "customer": [], "risk_limit": [], "rating": [], "fact_restr":[], "written_off":[],"collateral": []}
 
     for filename in os.listdir(folder):
         if filename.endswith(".xlsx") and not filename.startswith("~$"):
@@ -143,6 +143,30 @@ def load_data(folder: str, normalize_cols=True):
                     df_rating["source_file"] = filename
                     all_data["rating"].append(df_rating)
 
+                if "fact restructred" in xls.sheet_names:
+                    df_restr = xls.parse("fact restructred", header=1)
+                    if normalize_cols:
+                        df_restr.columns = [str(c).strip().lower().replace(" ", "_") for c in df_restr.columns]
+
+                    for col_to_drop in ["cust_name", "group"]:
+                        if col_to_drop in df_restr.columns:
+                            df_restr = df_restr.drop(columns=[col_to_drop])
+                            
+                    for date_col in ["restrcuturing_date", "1st_repayment_date"]: 
+                        if date_col in df_restr.columns:df_restr[date_col] = pd.to_datetime(df_restr[date_col], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+
+                    df_restr["source_file"] = filename
+                    all_data["fact_restr"].append(df_restr)
+
+                if "Fact writeen-off" in xls.sheet_names:
+                    df_restr = xls.parse("Fact writeen-off", header=1)
+                    if normalize_cols:
+                        df_restr.columns = [str(c).strip().lower().replace(" ", "_") for c in df_restr.columns]
+                    if "date" in df_fact.columns:
+                        df_fact["date"] = pd.to_datetime(df_fact["date"], errors='coerce', dayfirst=True).dt.strftime('%d/%m/%Y')
+                    df_restr["source_file"] = filename
+                    all_data["written_off"].append(df_restr)
+
                 if "Collateral Details" in xls.sheet_names:
                     df_coll = xls.parse("Collateral Details")
                     if normalize_cols:
@@ -159,6 +183,8 @@ def load_data(folder: str, normalize_cols=True):
         "customer": pd.concat(all_data["customer"], ignore_index=True).drop_duplicates(subset=['cust_id']),
         "risk_limit": pd.concat(all_data["risk_limit"], ignore_index=True) if all_data["risk_limit"] else None,
         "rating": pd.concat(all_data["rating"], ignore_index=True) if all_data["rating"] else None,
+        "fact_restr": pd.concat(all_data["fact_restr"], ignore_index=True) if all_data["fact_restr"] else None,
+        "written_off": pd.concat(all_data["written_off"], ignore_index=True) if all_data["written_off"] else None,
         "collateral": pd.concat(all_data["collateral"], ignore_index=True) if all_data["collateral"] else None
     }
 
@@ -172,15 +198,19 @@ def load_data(folder: str, normalize_cols=True):
         merged_data["fact_risk"],
         merged_data["risk_limit"],
         merged_data["rating"],
+        merged_data["fact_restr"],
+        merged_data["written_off"],
         merged_data["collateral"]
     )
 
 class RiskDataModel:
-    def __init__(self, customer_df, fact_df, rl_df, rating_df, collateral_df):
+    def __init__(self, customer_df, fact_df, rl_df, rating_df, factrestr_df, written_df,collateral_df):
         self.df_fact_risk = fact_df
         self.df_customer = customer_df
         self.rl_df = rl_df
         self.df_rating = rating_df
+        self.df_restr=factrestr_df
+        self.df_written=written_df
         self.df_collateral = collateral_df
         self.data_folder = DATA_FOLDER  # wherever you pass it from main
 
@@ -247,6 +277,18 @@ class RiskDataModel:
         self.df_joined = self.df_joined.rename(columns={col: f'additional_provision_at_{int(float(col)*100)}_percent'
                    for col in self.df_joined.columns
                    if col.replace('.', '', 1).isdigit()})
+        
+        if self.df_restr is not None:
+            if "cust_id" in self.df_restr.columns and  "date" in self.df_restr.columns and  "restrcuturing_date" in self.df_restr.columns:
+                self.df_restr["date"] = pd.to_datetime(self.df_restr["date"], errors="coerce", dayfirst=True)
+                self.df_restr["restrcuturing_date"] = pd.to_datetime(self.df_restr["restrcuturing_date"], errors="coerce", dayfirst=True)
+                self.df_restr["1st_repayment_date"] = pd.to_datetime(self.df_restr["1st_repayment_date"], errors="coerce", dayfirst=True)
+                self.df_joined["date"] = pd.to_datetime(self.df_joined["date"], errors="coerce", dayfirst=True)
+                self.df_restr["loan_restr_flag"] = self.df_restr["restrcuturing_date"].apply(lambda x: "yes" if pd.notnull(x) else "no")
+
+                self.df_restr = self.df_restr[["cust_id", "date", "restrcuturing_date", "1st_repayment_date", "loan_restr_flag"]].drop_duplicates()
+                self.df_joined = pd.merge(self.df_joined,self.df_restr,how="left",on=["cust_id", "date"])
+                self.df_joined["loan_restr_flag"] = self.df_joined["loan_restr_flag"].fillna("no")
 
     def _join_collateral(self):
         if self.df_collateral is None or self.df_customer is None:
@@ -381,6 +423,49 @@ class RiskDataModel:
             if dimension_filter_field and dimension_filter_value:
                 return {dimension_filter_field: dimension_filter_value, **result}
             return result
+        
+    def writtenoff_sum_by_dimension(self, fact_field, date_filter=None, dimension_filters=None):
+        if self.df_written is None:
+            raise FileNotFoundError("Source data is not found.")
+        
+        df = self.df_written.copy()
+        if fact_field not in df.columns:
+            raise ValueError(f"Fact field '{fact_field}' is not found.")
+        
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        if date_filter:
+            try:
+                date_val = pd.to_datetime(date_filter, dayfirst=True)
+                df = df[df["date"] == date_val]
+            except Exception:
+                raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+            
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
+                else:
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+        for field, value in filters_dict.items():
+            if pd.api.types.is_numeric_dtype(df[field]):
+                df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+            else:
+                df = df[df[field].astype(str) == str(value)]
+        
+
+        if df.empty:
+            raise FileNotFoundError("No data found after applying filters.")
+              
+        total = df[fact_field].sum()
+        result = {fact_field: float(round(total, 2))}
+        result.update(filters_dict)
+        return result
+        
 
     def get_avg_by_dimension(
         self,
@@ -553,6 +638,55 @@ class RiskDataModel:
 
         result.update(filters_dict)
         return result
+    
+    def writtenoff_count_distinct(
+    self,
+    dimension,
+    date_filter=None,
+    dimension_filters: Optional[str] = None):
+        
+        if self.df_written is None:
+            raise FileNotFoundError("Source data is not found.")
+        
+        df = self.df_written.copy()
+        if dimension not in df.columns:
+            raise ValueError(f"Fact field '{dimension}' is not found.")
+        
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        if date_filter:
+            try:
+                date_val = pd.to_datetime(date_filter, dayfirst=True)
+                df = df[df["date"] == date_val]
+            except Exception:
+                raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+
+
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
+                else:
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+        for field, value in filters_dict.items():
+            if pd.api.types.is_numeric_dtype(df[field]):
+                df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+            else:
+                df = df[df[field].astype(str) == str(value)]
+    
+
+        if df.empty:
+            raise FileNotFoundError("No data found after applying filters.")
+        
+        
+        result = {"count": df[dimension].dropna().nunique()}
+        result.update(filters_dict)
+        return result
+
 
     def get_concentration(self, fact_fields, group_by_fields=None, date_filter=None, top_n=10, dimension_filter_field=None, dimension_filter_value=None):
         if not hasattr(self, "df_joined") or self.df_joined is None:
@@ -2087,9 +2221,9 @@ class RiskDataModel:
                 "collateral_hawalat_haq": "Others"
             },
             True: {
-                "hc_collateral_building": "Collateral Land & Building",
-                "hc_collateral_cash": "Collateral Cash, Gold & Other Riskfree Assets",
-                "hc_collateral_shares": "Collateral Shares & Other Paper Assets",
+                "hc_collateral_land_and_building": "Collateral Land & Building",
+                "hc_collateral_cash_gold_and_other_riskfree_assests": "Collateral Cash, Gold & Other Riskfree Assets",
+                "hc_collateral_shares_and_other_paper_assests": "Collateral Shares & Other Paper Assets",
                 "hc_collateral_hawalat_haq": "Others"
             }
         }
@@ -2462,6 +2596,68 @@ class RiskDataModel:
 
         return result
     
+    def writtenoff_customer_details(self,
+    attributes: str,
+    customer_fields: str,
+    base_date: str,
+    dimension_filters: Optional[str] = None):
+        
+        if self.df_written is None:
+            raise FileNotFoundError("Source data is not found.")
+        
+        df = self.df_written.copy()
+        result = {}
+        result_cust_df=pd.DataFrame()
+        # Validate and parse inputs
+        attributes = [attr.strip() for attr in attributes.split(',') if attr.strip()]
+        customer_cols = [col.strip() for col in customer_fields.split(',') if col.strip()]
+        selected_fields = customer_cols + attributes
+
+        for field in attributes + customer_cols:
+            if field not in df.columns:
+                raise ValueError(f"Field '{field}' is not found in the dataset.")
+
+        
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+        if base_date:
+            try:
+                date_val = pd.to_datetime(base_date, dayfirst=True)
+                df = df[df["date"] == date_val]
+                result["base_period"] = date_val.strftime('%b %Y')
+            except Exception:
+                raise ValueError(f"Invalid date format: '{base_date}'. Please use 'dd/mm/yyyy' format.")
+            
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Dimension filter field '{field}' is not found in the dataset.")
+                    filters_dict[field] = value
+                else:
+                    raise ValueError(f"Invalid dimension filter format: '{pair}'. Expected 'field:value'.")
+
+        for field, value in filters_dict.items():
+            if pd.api.types.is_numeric_dtype(df[field]):
+                df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+            else:
+                df = df[df[field].astype(str) == str(value)]
+        
+        if df.empty:
+            raise FileNotFoundError("No data found after applying filters.")
+
+        result_cust_df = df[selected_fields]      
+        if 'amount' in result_cust_df.columns:
+            result_cust_df = result_cust_df.sort_values(by='amount', ascending=False)
+        else:
+            raise ValueError("Field 'amount' is not available for sorting. Please include it in the attributes.")
+
+        result["customers"] = result_cust_df.replace({np.nan: None}).to_dict(orient="records")
+        if filters_dict:
+            result["filters"] = filters_dict
+        return result
+    
     
     def get_provision_distr_type(self, dimension_filters: Optional[str] = None, date_filter: Optional[str] = None):
         if not hasattr(self, "df_joined") or self.df_joined is None:
@@ -2687,7 +2883,7 @@ class RiskDataModel:
             if df.empty:
                 raise FileNotFoundError("No data available after applying filters.")
             
-        label = "provision percentage" if numerator_field == "provision" else "coverage_ratio"
+        label = "provision_percentage" if numerator_field == "provision" else "coverage_ratio"
         if group_by_field:
             grouped = df.groupby(group_by_field).agg(
                 numerator_sum=(numerator_field, 'sum'),
@@ -3117,8 +3313,8 @@ app.openapi = custom_openapi
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(SCRIPT_DIR, "Sample_Bank_Data")
 logger.info(f"Looking for data in: {DATA_FOLDER}")
-customer_df, fact_df, rl_df, rating_df, collateral_df = load_data(DATA_FOLDER)
-risk_model = RiskDataModel(customer_df, fact_df, rl_df, rating_df, collateral_df)
+customer_df, fact_df, rl_df, rating_df,factrestr_df, written_df, collateral_df = load_data(DATA_FOLDER)
+risk_model = RiskDataModel(customer_df, fact_df, rl_df, rating_df, factrestr_df,written_df,collateral_df)
 from typing import Any, Optional
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, Field
@@ -3631,6 +3827,148 @@ def get_sum_by_dimension(
         raise HTTPException(status_code=404, detail=str(fnf))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
+# --- Success Model ---
+class WrittenoffSumResponse(RootModel[Dict[str, Union[str, int, float]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "court_Case": "y",
+                "amount": 46716468254
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Description of the error encountered")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'group' not found in the dataset."
+            }
+        }
+    
+@app.get(
+    "/writtenoff_sum_by_dimension",
+    response_model=WrittenoffSumResponse,
+    responses={
+    200: {
+        "description": "Returns aggregated results (grouped or total).",
+        "content": {
+            "application/json": {
+                "examples": {
+                    "Ungrouped Result": {
+                        "summary": "Basic aggregation",
+                        "value": [
+                            {"amount": 66090714697}
+                          
+                        ]
+                    },
+                    
+            
+                    "Ungrouped result with filter": {
+                        "summary": "Flat total with dimension filter ",
+                        "value": {
+                            "court_case": "y",
+                            "amount": 46716468254
+                        }
+                    }
+                }
+            }
+        }
+    },
+    400: {"model": ErrorResponse,"description": "Bad request — unexpected internal error.",
+            "content": {
+            "application/json": {
+                "example": {
+                    "error": "An unexpected error occurred'"
+                }
+            }
+        }
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "Source data not found.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "error": "Source file not found. Please ensure the dataset is loaded."
+                }
+            }
+        }
+    },
+    422: {
+        "description": "Validation error due to missing or incorrect query parameters.",
+        "content": {
+            "application/json": {
+                "example": {
+                    "detail": [
+                        {
+                            "loc": ["query", "fact_fields"],
+                            "msg": "field required",
+                            "type": "value_error.missing"
+                        },
+                        {
+                            "loc": ["query", "fact_fields"],
+                            "msg": "Fact field 'exposureee' not found",
+                            "type": "value_error.custom"
+                        },
+                        {
+                            "loc": ["query", "date_filter"],
+                            "msg": "Invalid date format: '12/10/145'. Please use 'dd/mm/yyyy' format.",
+                            "type": "value_error.date"
+                        },
+                        {
+                            "loc": ["query", "dimension_filter_field"],
+                            "msg": "str type expected",
+                            "type": "type_error.str"
+                        },
+                        {
+                            "loc": ["query", "fact_fields"],
+                            "msg": "Invalid field name(s): Cust Name. Use lowercase with underscores (e.g., 'cust_name')",
+                            "type": "value_error.custom"
+                        },
+                        {
+                            "loc": ["query", "dimension_filter_field"],
+                            "msg": "Invalid field name: Sector Name. Use lowercase with underscores (e.g., 'sector_name')",
+                            "type": "value_error.custom"
+                        }
+                    ]
+                }
+            }
+        }
+    }
+},
+    summary="Get Sum by Dimension",
+    description="Aggregates one numeric fact field, optionally  filtered by date or a dimension value."
+)
+def writtenoff_sum_by_dimension(
+    fact_field: str = Query(..., description="Fact field to aggregate, e.g., 'exposure'"),
+    date_filter: Optional[str] = Query(None, description="Date in dd/mm/yyyy format"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1")):
+    try:
+        validate_field_names([fact_field], "fact_field")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
+
+        result = risk_model.writtenoff_sum_by_dimension(
+            fact_field=fact_field,
+            date_filter=date_filter,
+            dimension_filters=dimension_filters)
+        return result
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except HTTPException as http_exc:
+        # Re-raise HTTP exceptions to let FastAPI handle them properly
+        raise http_exc
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
 
 # --- Success Response Model ---
 class GroupedAvgRecord(RootModel[List[Dict[str, Union[str, int, float]]]]):
@@ -3975,6 +4313,139 @@ def count_distinct_values(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
     
+# --- Success Response Model ---
+class WrittenoffCountDistinctResponse(RootModel[Dict[str, Union[str, int]]]):
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "count": 40
+            }
+        }
+
+# --- Error Response Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'segment_name' not found in the dataset."
+            }
+        }
+
+@app.get(
+    "/writtenoff_count_distinct",
+    response_model=WrittenoffCountDistinctResponse,
+    responses={
+        200: {
+            "description": "Returns count of unique values in a dimension field.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filter": {
+                            "summary": "Number of distinct non-null values dimension field: cust_id",
+                            "value": {
+                                "count": 40
+                            }
+                        },
+                        "With Filter": {
+                            "summary": "Distinct non-null values with filter",
+                            "value": {
+                                "count": 28,
+                                "court_case": "Y"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Source file not found. Please ensure the dataset is loaded."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error — bad field, bad type, or bad value.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "dimension"],
+                                "msg": "field required",
+                                "type": "value_error.missing"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '12/10/145'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension"],
+                                "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores (e.g., 'cust_id')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_field"],
+                                "msg": "Invalid field name: Sector Name. Use lowercase with underscores (e.g., 'sector_name')",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filter_value"],
+                                "msg": "Dimension value 'finance' is not found in the filter 'sector'",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Count Distinct Values in a Dimension",
+    description="Returns the number of distinct non-null values in a specified dimension column, optionally filtered by date or dimension."
+)
+def writtenoff_count_distinct_values(
+    dimension: str = Query(..., description="Dimension field to count distinct values from (e.g., 'cust_id')"),
+    date_filter: Optional[str] = Query(None, description="Filter by date (format: dd/mm/yyyy)"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1") ):
+    try:
+        validate_field_names([dimension], "dimension")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
+     
+        result = risk_model.writtenoff_count_distinct(dimension,date_filter,dimension_filters)
+        return result or {"count": 0}  
+        
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+
+    except HTTPException as http_exc:
+        raise http_exc
+
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")    
+
 
 #endpoint: get_concentration-----------------
 # Success Response Model ---
@@ -5491,7 +5962,7 @@ def validate_metrics(metrics_str: str):
 
 def aggregated_metrics_by_field(
     metrics: str = Query(..., description="Comma-separated metrics with aggregation types, e.g. 'exposure:sum,provision:weighted_average'"),
-    group_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
+    group_by_field: Optional[str] = Query(None, description="Field to group the results by, e.g. 'rating'"),
     date_filter: Optional[str] = Query(None, description="Date filter in 'dd/mm/yyyy' format for example 31/12/2024"),
     dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Financials,staging:1"),
     top_n: Optional[int] = Query(10, description="Maximum number of top items to return."),
@@ -5502,8 +5973,8 @@ def aggregated_metrics_by_field(
         validate_metrics(metrics)
         for f in metrics.split(","):
             validate_field_names([f.split(":")[0]], "metrics")
-        if group_field:
-            validate_field_names([group_field], "group_field")
+        if group_by_field:
+            validate_field_names([group_by_field], "group_by_field")
         if dimension_filters:
             filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
             validate_field_names(filter_fields, "dimension_filters")
@@ -5512,7 +5983,7 @@ def aggregated_metrics_by_field(
             
         result = risk_model.get_aggregated_metrics_by_field(
             metrics=metrics,
-            group_by_field=group_field,
+            group_by_field=group_by_field,
             date_filter=date_filter,
             dimension_filters=dimension_filters,
             top_n=top_n,
@@ -6084,7 +6555,7 @@ class CustomerDetailsResponse(BaseModel):
     other_periods: Optional[List[str]] = None
     filters: Optional[Dict[str, Union[str, int, float]]] = None 
     #customers: List[Dict[str, Union[str, int, float]]]
-    customers: List[Dict[str, Optional[Union[str, int, float]]]]
+    customers: List[Dict[str, Optional[Union[str, int, float,date]]]]
 
 class ErrorResponse(BaseModel):
     error: str
@@ -6230,6 +6701,133 @@ def customer_details(
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
+
+# --------- Response Models ---------
+class WrittenoffCustomerDetailsResponse(BaseModel):
+    base_period: str
+    filters: Optional[Dict[str, Union[str, int, float]]] = None 
+    customers: List[Dict[str, Optional[Union[str, int, float,date]]]]
+
+class ErrorResponse(BaseModel):
+    error: str
+
+@app.get(
+    "/writtenoff_customer_details",
+    response_model= WrittenoffCustomerDetailsResponse,
+    responses={
+        200: {
+            "description": "Returns customer details for the given periods and attributes.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Base Only": {
+                            "summary": "Base period only",
+                            "value": {
+                                "base_period": "Jan-2024",
+                                "customers": [
+                                    {"cust_id": "1", "cust_name": "Acme", "exposure": 10000},
+                                    {"cust_id": "2", "cust_name": "Beta", "exposure": 15000}
+                                ]
+                            }
+                        }
+                       
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Bad request — unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'NoneType' object has no attribute 'copy'"
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or result not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No data found after applying filters."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation errors — incorrect inputs or field naming issues.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "attributes"],
+                                "msg": "Invalid field name(s): Exposure. Use lowercase with underscores (e.g., 'exposure').",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "customer_fields"],
+                                "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores (e.g., 'cust_id').",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "base_date"],
+                                "msg": "Invalid date format: '31/02/2024'. Please use 'dd/mm/yyyy'.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension_filters"],
+                                "msg": "Invalid dimension filter format: 'sectorRetail'. Expected 'field:value'.",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Customer Details",
+    description="Fetches customer attributes and metrics for the base period, with optional filters."
+)
+def writtenoff_customer_details(
+    attributes: str = Query(..., description="Comma-separated fields to include, e.g., exposure,provision,rating"),
+    customer_fields: str = Query(..., description="Comma-separated identity fields, e.g., cust_id,cust_name"),
+    base_date: str = Query(..., description="Base date in dd/mm/yyyy format"),
+    dimension_filters: Optional[str] = Query(None, description="Comma-separated filter:value pairs like sector:Retail,rating:1")
+):
+    try:
+        # Validate field naming
+        attribute_list = [attr.strip() for attr in attributes.split(',')]
+        customer_field_list = [col.strip() for col in customer_fields.split(',')]
+        validate_field_names(attribute_list, "attributes")
+        validate_field_names(customer_field_list, "customer_fields")
+        if dimension_filters:
+            filter_fields = [pair.split(':', 1)[0] for pair in dimension_filters.split(',') if ':' in pair]
+            validate_field_names(filter_fields, "dimension_filters")
+
+        result = risk_model.writtenoff_customer_details(
+            attributes=attributes,
+            customer_fields=customer_fields,
+            base_date=base_date,
+            dimension_filters=dimension_filters)
+        return result
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+
+    except HTTPException as http_exc:
+        raise http_exc
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
     
 #--end point : provision distribution by provision type---------
 class ProvisionDistributionTypeResponse(RootModel[Dict[str, Union[float, int]]]):
@@ -6787,6 +7385,24 @@ def collateral_distribution(
     except Exception as e:
         logger.exception("Unexpected error in /collateral_distribution")
         raise HTTPException(status_code=400, detail={"error": f"An unexpected error occurred: {str(e)}"})
+import re
+
+def to_snake_case(s):
+    # Replace spaces and hyphens with underscores
+    s = re.sub(r'[\s\-]+', '_', s)
+
+    # Insert underscores between camelCase or PascalCase transitions (except acronyms like HC)
+    s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+
+    return s.lower()
+
+def convert_keys_to_snake_case(obj):
+    if isinstance(obj, dict):
+        return {to_snake_case(k): convert_keys_to_snake_case(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_keys_to_snake_case(item) for item in obj]
+    else:
+        return obj
 
 #SuccessResponse Model
 class CollateralCustomerItem(BaseModel):
@@ -6942,7 +7558,7 @@ def get_top_collaterals(
             )
 
         # Return the result; FastAPI will validate and serialize it to List[CollateralItem]
-        return result
+        return convert_keys_to_snake_case(result)
 
     except ValueError as ve:
         # Handle validation errors (e.g., invalid type or date format)
@@ -6965,4 +7581,3 @@ def get_top_collaterals(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", port=8000, reload=True)
-
