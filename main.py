@@ -96,6 +96,15 @@ def parse_effective_date(filename: str) -> date:
     last_day = calendar.monthrange(year, month)[1]
     return date(year, month, last_day)
 
+def parse_custom_ecl_param(param_str: str) -> dict:
+        try:
+            return {
+                int(k.strip()): int(v.strip())
+                for k, v in (pair.split(":") for pair in param_str.split(",") if ":" in pair)
+            }
+        except Exception:
+            raise ValueError("Invalid format for 'customize_additional_provision_percent'. Use format like '1:2,3:5'")
+        
 def load_data(folder: str, normalize_cols=True):
     if not os.path.exists(folder):
         raise FileNotFoundError(f"Data folder '{folder}' does not exist. Please ensure 'Sample_Bank_Data' is in the repository root.")
@@ -277,6 +286,18 @@ class RiskDataModel:
         self.df_joined = self.df_joined.rename(columns={col: f'additional_provision_at_{int(float(col)*100)}_percent'
                    for col in self.df_joined.columns
                    if col.replace('.', '', 1).isdigit()})
+        
+        new_cols = {}
+        for pct in range(1, 101):
+            col_name = f"additional_provision_at_{pct}_percent"
+            if col_name not in self.df_joined.columns:
+                new_cols[col_name] = (
+                    (self.df_joined["exposure"] * (pct / 100) - self.df_joined["provision"])
+                    .apply(lambda x: x if x > 0 else 0)
+                )
+
+        if new_cols:
+            self.df_joined = pd.concat([self.df_joined, pd.DataFrame(new_cols)], axis=1)
         
         if self.df_restr is not None:
             if "cust_id" in self.df_restr.columns and  "date" in self.df_restr.columns and  "restrcuturing_date" in self.df_restr.columns:
@@ -3160,6 +3181,331 @@ class RiskDataModel:
 
         result.sort(key=lambda x: x["Collateral Value"] if x["Collateral Value"] is not None else float('-inf'), reverse=True)
         return result[:top_n] if top_n is not None else result
+    
+    def get_available_additional_provision_percent(self) -> List[int]:
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        matching_cols = [
+            int(col.replace("additional_provision_at_", "").replace("_percent", ""))
+            for col in self.df_joined.columns
+            if col.startswith("additional_provision_at_") and col.endswith("_percent")
+        ]
+
+        if not matching_cols:
+            raise FileNotFoundError("No 'additional_provision_at_<x>_percent' columns found in the dataset.")
+
+        return sorted(matching_cols)
+    
+    def calculate_incremental_provision(
+    self,
+    date_filter: str,
+    additional_provision_percent: int,
+    customize_additional_provision_percent: Optional[str] = None,
+    dimension_filters: Optional[str] = None
+    ):
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        try:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+
+        df = df[df["date"] == date_obj]
+
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' in pair:
+                    field, value = [p.strip() for p in pair.split(':', 1)]
+                    if field not in df.columns:
+                        raise ValueError(f"Filter field '{field}' not found in dataset.")
+                    filters_dict[field] = value
+                    if pd.api.types.is_numeric_dtype(df[field]):
+                        df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+                    else:
+                        df = df[df[field] == value]
+                else:
+                    raise ValueError(f"Invalid filter format: '{pair}'. Expected 'field:value'.")
+
+        if df.empty:
+            raise FileNotFoundError("No data found for the given filters and date.")
+
+        default_col = f"additional_provision_at_{additional_provision_percent}_percent"
+        if default_col not in df.columns:
+            raise ValueError(f"'{default_col}' column not found in dataset.")
+
+        df["_provision"] = df[default_col]
+
+        if customize_additional_provision_percent:
+            try:
+                custom_dict = parse_custom_ecl_param(customize_additional_provision_percent)
+            except Exception:
+                raise ValueError("Invalid format for 'customize_additional_provision_percent'. Use format like '1:2,3:5'")
+
+            for cust_id, pct in custom_dict.items():
+                col = f"additional_provision_at_{pct}_percent"
+                if col not in df.columns:
+                    raise ValueError(f"'{col}' column not found in dataset.")
+                df.loc[df["cust_id"] == cust_id, "_provision"] = df.loc[df["cust_id"] == cust_id, col]
+
+        total_provision = round(df["_provision"].sum(), 2)
+
+        return {
+            "incremental_provision": total_provision,
+            "filters": filters_dict if filters_dict else None
+        }
+    
+    def get_total_revised_provision(
+    self,
+    date_filter: str,
+    additional_provision_percent: int,
+    customize_additional_provision_percent: Optional[str] = None,
+    dimension_filters: Optional[str] = None
+    ):
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
+        try:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+
+        df = df[df["date"] == date_obj]
+
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(','):
+                if ':' not in pair:
+                    raise ValueError(f"Invalid filter format: '{pair}'. Expected 'field:value'.")
+                field, value = pair.split(':', 1)
+                field = field.strip()
+                value = value.strip()
+                if field not in df.columns:
+                    raise ValueError(f"Dimension filter field '{field}' not found in data.")
+                filters_dict[field] = value
+                if pd.api.types.is_numeric_dtype(df[field]):
+                    df = df[df[field] == pd.to_numeric(value, errors='coerce')]
+                else:
+                    df = df[df[field].astype(str) == value]
+
+        if df.empty:
+            raise FileNotFoundError("No data available after applying filters.")
+
+        base_col = f"additional_provision_at_{additional_provision_percent}_percent"
+        if base_col not in df.columns:
+            raise ValueError(f"Column '{base_col}' not found in data.")
+
+        df["total_provision"] = df["provision"] + df[base_col]
+
+        if customize_additional_provision_percent:
+            try:
+                overrides = {
+                    int(k.strip()): int(v.strip())
+                    for k, v in (item.split(':') for item in customize_additional_provision_percent.split(','))
+                }
+            except Exception:
+                raise ValueError("Invalid format for 'customize_additional_provision_percent'. Expected '1:5,2:7,...'")
+
+            for cust_id, custom_percent in overrides.items():
+                custom_col = f"additional_provision_at_{custom_percent}_percent"
+                if custom_col not in df.columns:
+                    raise ValueError(f"Column '{custom_col}' not found for customized provision percent.")
+                df.loc[df["cust_id"] == cust_id, "total_provision"] = (
+                    df.loc[df["cust_id"] == cust_id, "provision"] +
+                    df.loc[df["cust_id"] == cust_id, custom_col]
+                )
+
+        total = round(df["total_provision"].sum(), 2)
+        return {
+            "total_revised_provision": total,
+            "filters": filters_dict if filters_dict else None
+        }
+    
+    def get_revised_provision_percentage(
+    self,
+    date_filter: str,
+    additional_provision_percent: int,
+    customize_additional_provision_percent: Optional[str] = None,
+    dimension_filters: Optional[str] = None
+    ):
+        if not hasattr(self, "df_joined") or self.df_joined is None:
+            raise FileNotFoundError("Source data is not found.")
+
+        df = self.df_joined.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+
+        try:
+            date_obj = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy' format.")
+
+        df = df[df["date"] == date_obj]
+
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(","):
+                if ':' not in pair:
+                    raise ValueError(f"Invalid filter format: '{pair}'. Expected 'field:value'.")
+                field, value = pair.split(":", 1)
+                field = field.strip()
+                value = value.strip()
+                if field not in df.columns:
+                    raise ValueError(f"Field '{field}' not found in dataset.")
+                filters_dict[field] = value
+                if pd.api.types.is_numeric_dtype(df[field]):
+                    df = df[df[field] == pd.to_numeric(value, errors="coerce")]
+                else:
+                    df = df[df[field] == value]
+
+        if df.empty:
+            raise FileNotFoundError("No data available after applying filters.")
+
+        customized_map = {}
+        if customize_additional_provision_percent:
+            try:
+                customized_map = {
+                    int(k.strip()): int(v.strip())
+                    for k, v in (entry.split(":") for entry in customize_additional_provision_percent.split(","))
+                }
+            except Exception:
+                raise ValueError("Invalid format for 'customize_additional_ecl_percent'. Use 'cust_id:percent' pairs like '1:2,5:10'.")
+
+        base_col = f"additional_provision_at_{additional_provision_percent}_percent"
+        if base_col not in df.columns:
+            raise ValueError(f"Column '{base_col}' not found in dataset.")
+
+        def compute_adjusted(row):
+            if row["cust_id"] in customized_map:
+                custom_col = f"additional_provision_at_{customized_map[row['cust_id']]}_percent"
+                if custom_col not in df.columns:
+                    raise ValueError(f"Column '{custom_col}' not found for customized provision percent.")
+                return row["provision"] + row.get(custom_col, 0)
+            return row["provision"] + row[base_col]
+
+        df["adjusted_provision"] = df.apply(compute_adjusted, axis=1)
+
+        total_adjusted_provision = df["adjusted_provision"].sum()
+        total_exposure = df["exposure"].sum()
+
+        revised_charge = round((total_adjusted_provision / total_exposure) * 100, 2) if total_exposure != 0 else None
+
+        return {
+            "revised_provision_percentage": revised_charge,
+            "filters": filters_dict if filters_dict else None
+        }
+    
+    def get_customer_provision_details(
+    self,
+    attributes: List[str],
+    customer_fields: List[str],
+    date_filter: str,
+    additional_provision_percent: int,
+    customize_additional_provision_percent: Optional[str],
+    dimension_filters: Optional[str]
+    ) -> List[Dict[str, Union[str, int, float]]]:
+
+        if self.df_joined is None or self.df_joined.empty:
+            raise FileNotFoundError("Source data not loaded or merged.")
+
+        try:
+            target_date = pd.to_datetime(date_filter, dayfirst=True)
+        except Exception:
+            raise ValueError(f"Invalid date format: '{date_filter}'. Please use 'dd/mm/yyyy'.")
+
+        df_filtered = self.df_joined.copy()
+        df_filtered["date"] = pd.to_datetime(df_filtered["date"], errors="coerce", dayfirst=True)
+        df_filtered = df_filtered[df_filtered["date"] == target_date]
+
+        filters_dict = {}
+        if dimension_filters:
+            for pair in dimension_filters.split(","):
+                if ':' in pair:
+                    field, value = pair.split(":", 1)
+                    field = field.strip()
+                    value = value.strip()
+                    filters_dict[field] = value
+                    if field not in df_filtered.columns:
+                        raise ValueError(f"Field '{field}' not found in dataset.")
+                    if pd.api.types.is_numeric_dtype(df_filtered[field]):
+                        df_filtered = df_filtered[df_filtered[field] == pd.to_numeric(value, errors="coerce")]
+                    else:
+                        df_filtered = df_filtered[df_filtered[field] == value]
+
+        all_required = list(set(customer_fields + ["cust_name"] + attributes))
+
+        missing_cols = [col for col in all_required if col not in df_filtered.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns in dataset: {', '.join(missing_cols)}")
+
+        df_result = df_filtered[all_required].copy()
+
+        # --- Handle overrides ---
+        custom_ecl = {}
+        if customize_additional_provision_percent:
+            try:
+                for pair in customize_additional_provision_percent.split(","):
+                    cust_id, percent = pair.split(":")
+                    custom_ecl[str(cust_id).strip()] = int(percent)
+            except Exception:
+                raise ValueError("Invalid format for customize_additional_ecl_percent. Expected format: 'cust_id:percent'")
+
+        # --- Compute provision & charges ---
+        provision_revised = []
+        provision_charge_revised = []
+        applied_ecl_percent = []
+
+        for _, row in df_result.iterrows():
+            cust_id = str(row["cust_id"])
+            base_provision = float(row["provision"])
+            exposure = float(row["exposure"])
+            ecl_pct = custom_ecl.get(cust_id, additional_provision_percent)
+
+            col_name = f"additional_provision_at_{ecl_pct}_percent"
+            if col_name not in df_filtered.columns:
+                raise ValueError(f"Expected column '{col_name}' not found in dataset.")
+
+            addl_provision = df_filtered.loc[df_filtered["cust_id"] == row["cust_id"], col_name].values
+            addl_provision = float(addl_provision[0]) if len(addl_provision) else 0.0
+
+            revised = base_provision + addl_provision
+            charge_pct = (revised / exposure * 100) if exposure else 0.0
+
+            provision_revised.append(round(revised, 2))
+            provision_charge_revised.append(round(charge_pct, 2))
+            applied_ecl_percent.append(ecl_pct)
+
+        df_result["provision_revised"] = provision_revised
+        df_result["provision_percentage_revised"] = provision_charge_revised
+        df_result["additional_provision_percentage"] = applied_ecl_percent
+
+        if "ecl" in attributes and "ecl" in df_result.columns:
+            df_result.rename(columns={"ecl": "provision_percentage"}, inplace=True)
+
+        desired_order = [
+            "cust_id", "cust_name", "exposure", "provision", "provision_percentage",
+            "additional_provision_percentage", "provision_revised", "provision_percentage_revised",
+            "staging", "dpd", "rating", "total_collateral"
+        ]
+
+        final_columns = [col for col in desired_order if col in df_result.columns]
+        df_result = df_result[final_columns]
+
+        if "exposure" in df_result.columns:
+            df_result = df_result.sort_values(by="exposure", ascending=False).reset_index(drop=True)
+        
+        result = df_result.to_dict(orient="records")
+        if filters_dict:
+            return [filters_dict] + result
+        else:
+            return result
 
 
 def calculate_breaches(requested_date: date, page: int, size: int, customer_df, fact_df, rl_df):
@@ -7587,7 +7933,655 @@ def get_top_collaterals(
                 details=str(e)
             ).dict()
         )
+    
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
 
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "No 'additional_provision_at_<x>_percent' columns found in the dataset."
+            }
+        }
+
+@app.get(
+    "/additional_provision_percent",
+    response_model=List[int],
+    responses={
+        200: {
+            "description": "Returns a list of available additional provision percentage thresholds.",
+            "content": {
+                "application/json": {
+                    "example": [5, 10, 15, 20, 25, 30]
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or required columns not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No 'additional_provision_at_<x>_percent' columns found in the dataset."
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'int() argument must be a string, a bytes-like object or a number'"
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Available Additional Provision Percentages",
+    description="Returns a sorted list of additional provision percentages."
+)
+def additional_provision_percent():
+    try:
+        return risk_model.get_available_additional_provision_percent()
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
+class IncrementalProvisionResponse(BaseModel):
+    incremental_provision: float
+    filters: Optional[Dict[str, str]] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "filters": {
+                    "sector": "Retail",
+                    "group": "1"
+                },
+                "incremental_provision": 7342983.52
+            }
+        }
+
+class ErrorResponse(BaseModel):
+    error: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Invalid filter format: 'sectorRetail'. Expected 'field:value'."
+            }
+        }
+   
+@app.get(
+    "/incremental_provision",
+    response_model=IncrementalProvisionResponse,
+    responses={
+        200: {
+            "description": "Returns the computed incremental provision.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Default Provision": {
+                            "summary": "Using only base provision % (no overrides)",
+                            "value": {
+                                "incremental_provision": 7342983.52,
+                                "filters": "null"
+                            }
+                        },
+                        "With Dimension Filter": {
+                            "summary": "Filtered by sector and group",
+                            "value": {
+                                "incremental_provision": 2219832.14,
+                                "filters":{
+                                "sector": "Retail",
+                                "group": "1"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or relevant records not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No data found for the given filters and date."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error — invalid fields, filter format, or date format.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '32/13/2024'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension_filters"],
+                                "msg": "Invalid filter format: 'sectorRetail'. Expected 'field:value'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "customize_additional_provision_percent"],
+                                "msg": "Invalid format for 'customize_additional_provision_percent'. Use format like '1:2,3:5'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "additional_provision_percent"],
+                                "msg": "'additional_provision_at_15.0_percent' column not found in dataset.",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'int' object is not subscriptable"
+                    }
+                }
+            }
+        }
+    },
+    summary="Calculate Incremental Provision",
+    description="Computes the provision using a default provision percentage or per-customer override, with optional filters."
+)
+def incremental_provision(
+    date_filter: str = Query(..., description="Date in 'dd/mm/yyyy' format"),
+    additional_provision_percent: int = Query(..., description="Global additional provision percent to apply"),
+    customize_additional_provision_percent: Optional[str] = Query(
+        None, description="Optional overrides per-customer in 'cust_id:percent' format, e.g. '1:2,3:5'"
+    ),
+    dimension_filters: Optional[str] = Query(
+        None, description="Optional filters like 'sector:Retail,group:1'"
+    )
+):
+    try:
+        return risk_model.calculate_incremental_provision(
+            date_filter=date_filter,
+            additional_provision_percent=additional_provision_percent,
+            customize_additional_provision_percent=customize_additional_provision_percent,
+            dimension_filters=dimension_filters
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+
+class TotalRevisedProvisionResponse(BaseModel):
+    total_revised_provision: float
+    filters: Optional[Dict[str, str]] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "filters": {
+                    "sector": "Retail",
+                    "group": "1"
+                },
+                "total_revised_provision": 9834721.38
+            }
+        }
+
+class ErrorResponse(BaseModel):
+    error: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Column 'additional_provision_at_10_percent' not found in data."
+            }
+        }
+
+@app.get(
+    "/total_revised_provision",
+    response_model=TotalRevisedProvisionResponse,
+    responses={
+        200: {
+            "description": "Returns total revised provision after applying the base and optional overrides.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filters": {
+                            "summary": "Total provision without filters",
+                            "value": {
+                                "total_revised_provision": 9821356.72,
+                                "filters": "null"
+                            }
+                        },
+                        "With Sector Filter": {
+                            "summary": "Total provision for Retail sector, group 1",
+                            "value": {
+                                "total_revised_provision": 3412874.55,
+                                "filters": {
+                                "sector": "Retail",
+                                "group": "1"
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or filtered results not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No data available after applying filters."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation errors — bad date, fields, or filter/override formats.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '35/01/2024'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension_filters"],
+                                "msg": "Invalid filter format: 'sectorRetail'. Expected 'field:value'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "customize_additional_provision_percent"],
+                                "msg": "Invalid format for 'customize_additional_provision_percent'. Expected '1:5,2:7,...'",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "additional_provision_percent"],
+                                "msg": "Column 'additional_provision_at_10_percent' not found in data.",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal processing error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'NoneType' object is not subscriptable"
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Total Revised Provision",
+    description="Computes the total revised provision including the base provision percent and any per-customer overrides, with optional dimension filters."
+)
+def total_revised_provision(
+    date_filter: str = Query(..., description="Date in 'dd/mm/yyyy' format"),
+    additional_provision_percent: int = Query(..., description="Additional provision percent for all customers"),
+    customize_additional_provision_percent: Optional[str] = Query(
+        None, description="Overrides as 'cust_id:percent', e.g. '1:5,2:7'"
+    ),
+    dimension_filters: Optional[str] = Query(
+        None, description="Comma-separated filters like 'sector:Retail,group:1'"
+    )
+):
+    try:
+        return risk_model.get_total_revised_provision(
+            date_filter=date_filter,
+            additional_provision_percent=additional_provision_percent,
+            customize_additional_provision_percent=customize_additional_provision_percent,
+            dimension_filters=dimension_filters
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+
+class RevisedProvisionPercentageResponse(BaseModel):
+    revised_provision_percentage: Optional[float]
+    filters: Optional[Dict[str, str]] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "filters": {
+                    "sector": "Retail",
+                    "group": "1"
+                },
+                "revised_provision_percentage": 4.52
+            }
+        }
+
+class ErrorResponse(BaseModel):
+    error: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Invalid format for 'customize_additional_provision_percent'. Use 'cust_id:percent' pairs like '1:2,5:10'."
+            }
+        }
+
+@app.get(
+    "/revised_provision_percentage",
+    response_model=RevisedProvisionPercentageResponse,
+    responses={
+        200: {
+            "description": "Returns the percentage of provision over exposure after applying provision logic.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Basic Result": {
+                            "summary": "Without filters",
+                            "value": {
+                                "revised_provision_percentage": 3.75
+                            }
+                        },
+                        "With Filters": {
+                            "summary": "Sector,group-wise filtered result",
+                            "value": {
+                                "revised_provision_percentage": 4.52,
+                                "filters": {
+                                "sector": "Retail",
+                                "group": "1"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "Source data or filtered results not found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "No data available after applying filters."
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation errors — bad date, field names, or override format.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '31/13/2024'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "dimension_filters"],
+                                "msg": "Invalid filter format: 'sectorRetail'. Expected 'field:value'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "customize_additional_provision_percent"],
+                                "msg": "Invalid format for 'customize_additional_provision_percent'. Use 'cust_id:percent' pairs like '1:2,5:10'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "additional_provision_percent"],
+                                "msg": "Column 'additional_provision_at_10.5_percent' not found in dataset.",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal processing error.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "An unexpected error occurred: 'NoneType' object is not subscriptable"
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Revised Provision Percentage",
+    description="Computes the revised provision as a percentage of exposure. Supports base and per-customer override provision logic, with optional filters."
+)
+def revised_provision_percentage(
+    date_filter: str = Query(..., description="Date in dd/mm/yyyy format"),
+    additional_provision_percent: int = Query(..., description="Default additional provision percent to apply"),
+    customize_additional_provision_percent: Optional[str] = Query(
+        None, description="Custom additional provision % per cust_id in format: 1:2,5:10"
+    ),
+    dimension_filters: Optional[str] = Query(
+        None, description="Comma-separated filters in format: sector:Retail,group:1"
+    )
+):
+    try:
+        result = risk_model.get_revised_provision_percentage(
+            date_filter=date_filter,
+            additional_provision_percent=additional_provision_percent,
+            customize_additional_provision_percent=customize_additional_provision_percent,
+            dimension_filters=dimension_filters
+        )
+        return result
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
+class CustomerProvisionSummaryResponse(RootModel[List[Dict[str, Union[str, int, float]]]]):
+    class Config:
+        json_schema_extra = {
+            "example": [
+                {
+                    "cust_id": "C001",
+                    "cust_name": "Acme Corp",
+                    "exposure": 100000,
+                    "provision": 2500,
+                    "rating": 3,
+                    "provision_revised": 3500.0,
+                    "provision_percentage_revised": 3.5,
+                    "additional_provision_percentage": 5
+                },
+                {
+                    "cust_id": "C002",
+                    "cust_name": "Beta Ltd",
+                    "exposure": 120000,
+                    "provision": 3000,
+                    "rating": 2,
+                    "provision_revised": 4500.0,
+                    "provision_percentage_revised": 3.75,
+                    "additional_provision_percentage": 7
+                }
+            ]
+        }
+
+# --- Error Model ---
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "error": "Invalid field name(s): Exposure Amt. Use lowercase with underscores (e.g., 'exposure')"
+            }
+        }
+
+@app.get(
+    "/customer_provision_details",
+    response_model=CustomerProvisionSummaryResponse,
+    responses={
+        200: {
+            "description": "Returns customer-level attributes with provision calculations",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "Without Filters": {
+                            "summary": "Unfiltered provision results",
+                            "value": [
+                                {
+                                    "cust_id": "C001",
+                                    "cust_name": "Acme Corp",
+                                    "exposure": 100000,
+                                    "provision": 2500,
+                                    "rating": 3,
+                                    "provision_revised": 3500.0,
+                                    "provision_percentage_revised": 3.5,
+                                    "additional_provision_percentage": 5
+                                },
+                                {
+                                    "cust_id": "C002",
+                                    "cust_name": "Beta Ltd",
+                                    "exposure": 120000,
+                                    "provision": 3000,
+                                    "rating": 2,
+                                    "provision_revised": 4500.0,
+                                    "provision_percentage_revised": 3.75,
+                                    "additional_provision_percentage": 7
+                                }
+                            ]
+                        },
+                        "With Filters": {
+                            "summary": "Results with sector and group filters",
+                            "value": [
+                                {
+                                    "sector": "Retail",
+                                    "group": "2"
+                                },
+                                {
+                                    "cust_id": "C003",
+                                    "cust_name": "Gamma Inc",
+                                    "exposure": 80000,
+                                    "provision": 1800,
+                                    "rating": 4,
+                                    "provision_revised": 2400.0,
+                                    "provision_percentage_revised": 3.0,
+                                    "additional_provision_percentage": 5
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Unexpected internal error or bad input"
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No data found after applying filters"
+        },
+        422: {
+            "description": "Validation error — incorrect fields or formats",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": [
+                            {
+                                "loc": ["query", "attributes"],
+                                "msg": "Invalid field name(s): Exposure. Use lowercase with underscores (e.g., 'exposure').",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "customer_fields"],
+                                "msg": "Invalid field name(s): Cust ID. Use lowercase with underscores (e.g., 'cust_id').",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "date_filter"],
+                                "msg": "Invalid date format: '31/13/2024'. Please use 'dd/mm/yyyy' format.",
+                                "type": "value_error.date"
+                            },
+                            {
+                                "loc": ["query", "customize_additional_provision_percent"],
+                                "msg": "Invalid format for 'customize_additional_provision_percent'. Use 'cust_id:percent' pairs like '1:2,5:10'.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "additional_provision_percent"],
+                                "msg": "Column 'additional_provision_at_10.5_percent' not found in dataset.",
+                                "type": "value_error.custom"
+                            },
+                            {
+                                "loc": ["query", "dimension_filters"],
+                                "msg": "Invalid filter format: 'sectorRetail'. Expected 'field:value'.",
+                                "type": "value_error.custom"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    summary="Get Customer Provision Summary",
+    description="Returns customer fields and attributes with calculated provision revised and provision charge revised using a global or customized provision percent."
+)
+def customer_provision_details(
+    attributes: str = Query(..., description="Comma-separated metrics to include (e.g., 'exposure,provision,rating')"),
+    customer_fields: str = Query(..., description="Comma-separated ID fields (e.g., 'cust_id,cust_name')"),
+    date_filter: str = Query(..., description="Date in dd/mm/yyyy format"),
+    additional_provision_percent: int = Query(..., description="Global additional provision percent to apply (1-100)"),
+    customize_additional_provision_percent: Optional[str] = Query(None, description="Overrides per customer in 'cust_id:percent' format, e.g., '1:5,3:7'"),
+    dimension_filters: Optional[str] = Query(None, description="Optional filters like 'sector:Retail,group:1'")
+):
+    try:
+        attr_list = [a.strip() for a in attributes.split(",") if a.strip()]
+        cust_fields_list = [c.strip() for c in customer_fields.split(",") if c.strip()]
+        validate_field_names(attr_list, "attributes")
+        validate_field_names(cust_fields_list, "customer_fields")
+        if dimension_filters:
+            filter_fields = [f.split(":")[0] for f in dimension_filters.split(",") if ":" in f]
+            validate_field_names(filter_fields, "dimension_filters")
+
+        return risk_model.get_customer_provision_details(
+            attributes=attr_list,
+            customer_fields=cust_fields_list,
+            date_filter=date_filter,
+            additional_provision_percent=additional_provision_percent,
+            customize_additional_provision_percent=customize_additional_provision_percent,
+            dimension_filters=dimension_filters
+        )
+
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except FileNotFoundError as fnf:
+        raise HTTPException(status_code=404, detail=str(fnf))
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"An unexpected error occurred: {str(e)}")
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", port=8000, reload=True)
